@@ -7,7 +7,8 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "node-telegram-bot-api": "^0.63.0",
-    "lru-cache": "^10.2.0"
+  "node-telegram-bot-api": "^0.66.0",
+  "yt-dlp-wrap": "^2.3.12",
+  "lru-cache": "^10.2.1"
   }
 }
