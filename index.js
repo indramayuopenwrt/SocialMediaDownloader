@@ -1,6 +1,6 @@
 "use strict";
 
-/* ================= DEPENDENCIES ================= */
+/* ================= IMPORT ================= */
 const TelegramBot = require("node-telegram-bot-api");
 const { exec } = require("child_process");
 const { LRUCache } = require("lru-cache");
@@ -9,11 +9,11 @@ const path = require("path");
 
 /* ================= ENV ================= */
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const ADMIN_ID = Number(process.env.ADMIN_ID); // isi Telegram user id kamu
-const DOWNLOAD_DIR = "/tmp";
+const ADMIN_ID = Number(process.env.ADMIN_ID || 0);
+const TMP_DIR = "/tmp";
 
 if (!BOT_TOKEN) {
-  console.error("❌ BOT_TOKEN belum diset");
+  console.error("BOT_TOKEN belum diset");
   process.exit(1);
 }
 
@@ -23,18 +23,150 @@ const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 /* ================= CACHE ================= */
 const cache = new LRUCache({
   max: 100,
-  ttl: 1000 * 60 * 30 // 30 menit
+  ttl: 1000 * 60 * 30
 });
 
 /* ================= QUEUE ================= */
 const queue = [];
-let processing = false;
+let isProcessing = false;
 
-/* ================= RATE LIMIT ================= */
+/* ================= LIMIT ================= */
 const cooldown = new Map();
-const USER_DELAY = 15; // detik
+const USER_DELAY = 15;
 
 /* ================= STATS ================= */
+const stats = {
+  start: Date.now(),
+  total: 0,
+  success: 0,
+  failed: 0
+};
+
+/* ================= HELPERS ================= */
+const isAdmin = (id) => id === ADMIN_ID;
+
+function detectPlatform(url) {
+  if (/youtu\.?be/.test(url)) return "YouTube";
+  if (/tiktok\.com/.test(url)) return "TikTok";
+  if (/instagram\.com/.test(url)) return "Instagram";
+  if (/facebook\.com|fb\.watch/.test(url)) return "Facebook";
+  return "Unknown";
+}
+
+function canRequest(userId) {
+  if (isAdmin(userId)) return true;
+  const last = cooldown.get(userId) || 0;
+  const now = Date.now();
+  if (now - last < USER_DELAY * 1000) return false;
+  cooldown.set(userId, now);
+  return true;
+}
+
+function ytDlpCmd(url) {
+  return `yt-dlp -f "bv*[height<=1080]/bv*+ba/b" --merge-output-format mp4 -o "${TMP_DIR}/%(id)s.%(ext)s" "${url}"`;
+}
+
+/* ================= QUEUE RUNNER ================= */
+function runQueue() {
+  if (isProcessing || queue.length === 0) return;
+
+  isProcessing = true;
+  const job = queue.shift();
+  const { msg, url } = job;
+  const chatId = msg.chat.id;
+
+  const platform = detectPlatform(url);
+
+  bot.sendMessage(
+    chatId,
+    `⏳ Download ${platform}\n🧠 Queue: ${queue.length}`
+  );
+
+  exec(ytDlpCmd(url), async (err) => {
+    try {
+      if (err) throw err;
+
+      const file = fs.readdirSync(TMP_DIR).find(f => f.endsWith(".mp4"));
+      if (!file) throw new Error("File not found");
+
+      const filePath = path.join(TMP_DIR, file);
+      cache.set(url, filePath);
+
+      await bot.sendVideo(chatId, filePath);
+      fs.unlinkSync(filePath);
+
+      stats.success++;
+    } catch (e) {
+      stats.failed++;
+      await bot.sendMessage(chatId, "❌ Gagal download");
+      console.error(e);
+    } finally {
+      isProcessing = false;
+      runQueue();
+    }
+  });
+}
+
+/* ================= ENQUEUE ================= */
+function enqueue(msg, url) {
+  const userId = msg.from.id;
+  const chatId = msg.chat.id;
+
+  if (!canRequest(userId)) {
+    return bot.sendMessage(chatId, "⏳ Tunggu sebentar...");
+  }
+
+  if (cache.has(url)) {
+    return bot.sendVideo(chatId, cache.get(url));
+  }
+
+  if (isAdmin(userId)) {
+    queue.unshift({ msg, url });
+  } else {
+    queue.push({ msg, url });
+  }
+
+  bot.sendMessage(chatId, `📥 Masuk queue (${queue.length})`);
+  runQueue();
+}
+
+/* ================= COMMANDS ================= */
+bot.onText(/\/start/, (msg) => {
+  bot.sendMessage(
+    msg.chat.id,
+    "👋 Downloader Bot\nKirim link YT / FB / IG / TikTok"
+  );
+});
+
+bot.onText(/\/stats/, (msg) => {
+  const uptime = Math.floor((Date.now() - stats.start) / 1000);
+  bot.sendMessage(
+    msg.chat.id,
+    `📊 Statistik
+⏱ Uptime: ${uptime}s
+📥 Total: ${stats.total}
+✅ Sukses: ${stats.success}
+❌ Gagal: ${stats.failed}
+🧠 Queue: ${queue.length}
+💾 Cache: ${cache.size}`
+  );
+});
+
+/* ================= MESSAGE ================= */
+bot.on("message", (msg) => {
+  if (!msg.text) return;
+  if (msg.text.startsWith("/")) return;
+  if (!msg.text.startsWith("http")) return;
+
+  stats.total++;
+  enqueue(msg, msg.text.trim());
+});
+
+/* ================= SAFETY ================= */
+process.on("unhandledRejection", console.error);
+process.on("uncaughtException", console.error);
+
+console.log("✅ Bot RUNNING (stable, queue enabled)");/* ================= STATS ================= */
 const stats = {
   start: Date.now(),
   total: 0,
