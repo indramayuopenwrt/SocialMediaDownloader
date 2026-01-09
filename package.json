@@ -1,9 +1,13 @@
 {
   "name": "telegram-downloader-bot",
   "version": "1.0.0",
-  "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.64.0",
+    "ytdlp-wrap": "^2.3.12",
+    "lru-cache": "^10.2.0"
   }
 }
