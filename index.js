@@ -13,7 +13,7 @@ const ADMIN_ID = Number(process.env.ADMIN_ID || 0);
 const TMP_DIR = "/tmp";
 
 if (!BOT_TOKEN) {
-  console.error("BOT_TOKEN belum diset");
+  console.error("❌ BOT_TOKEN belum diset");
   process.exit(1);
 }
 
@@ -28,13 +28,13 @@ const cache = new LRUCache({
 
 /* ================= QUEUE ================= */
 const queue = [];
-let isProcessing = false;
+let processing = false;
 
 /* ================= LIMIT ================= */
 const cooldown = new Map();
 const USER_DELAY = 15;
 
-/* ================= STATS ================= */
+/* ================= STATS (HANYA SATU) ================= */
 const stats = {
   start: Date.now(),
   total: 0,
@@ -45,6 +45,14 @@ const stats = {
 /* ================= HELPERS ================= */
 const isAdmin = (id) => id === ADMIN_ID;
 
+function canRequest(id) {
+  if (isAdmin(id)) return true;
+  const last = cooldown.get(id) || 0;
+  if (Date.now() - last < USER_DELAY * 1000) return false;
+  cooldown.set(id, Date.now());
+  return true;
+}
+
 function detectPlatform(url) {
   if (/youtu\.?be/.test(url)) return "YouTube";
   if (/tiktok\.com/.test(url)) return "TikTok";
@@ -53,36 +61,22 @@ function detectPlatform(url) {
   return "Unknown";
 }
 
-function canRequest(userId) {
-  if (isAdmin(userId)) return true;
-  const last = cooldown.get(userId) || 0;
-  const now = Date.now();
-  if (now - last < USER_DELAY * 1000) return false;
-  cooldown.set(userId, now);
-  return true;
-}
-
-function ytDlpCmd(url) {
+function ytCmd(url) {
   return `yt-dlp -f "bv*[height<=1080]/bv*+ba/b" --merge-output-format mp4 -o "${TMP_DIR}/%(id)s.%(ext)s" "${url}"`;
 }
 
-/* ================= QUEUE RUNNER ================= */
+/* ================= QUEUE PROCESS ================= */
 function runQueue() {
-  if (isProcessing || queue.length === 0) return;
+  if (processing || queue.length === 0) return;
+  processing = true;
 
-  isProcessing = true;
   const job = queue.shift();
-  const { msg, url } = job;
-  const chatId = msg.chat.id;
+  const chatId = job.msg.chat.id;
+  const url = job.url;
 
-  const platform = detectPlatform(url);
+  bot.sendMessage(chatId, `⏳ Processing (${detectPlatform(url)})`);
 
-  bot.sendMessage(
-    chatId,
-    `⏳ Download ${platform}\n🧠 Queue: ${queue.length}`
-  );
-
-  exec(ytDlpCmd(url), async (err) => {
+  exec(ytCmd(url), async (err) => {
     try {
       if (err) throw err;
 
@@ -98,10 +92,10 @@ function runQueue() {
       stats.success++;
     } catch (e) {
       stats.failed++;
-      await bot.sendMessage(chatId, "❌ Gagal download");
+      await bot.sendMessage(chatId, "❌ Download gagal");
       console.error(e);
     } finally {
-      isProcessing = false;
+      processing = false;
       runQueue();
     }
   });
@@ -110,40 +104,34 @@ function runQueue() {
 /* ================= ENQUEUE ================= */
 function enqueue(msg, url) {
   const userId = msg.from.id;
-  const chatId = msg.chat.id;
 
   if (!canRequest(userId)) {
-    return bot.sendMessage(chatId, "⏳ Tunggu sebentar...");
+    return bot.sendMessage(msg.chat.id, "⏳ Tunggu sebentar...");
   }
 
   if (cache.has(url)) {
-    return bot.sendVideo(chatId, cache.get(url));
+    return bot.sendVideo(msg.chat.id, cache.get(url));
   }
 
-  if (isAdmin(userId)) {
-    queue.unshift({ msg, url });
-  } else {
-    queue.push({ msg, url });
-  }
+  isAdmin(userId)
+    ? queue.unshift({ msg, url })
+    : queue.push({ msg, url });
 
-  bot.sendMessage(chatId, `📥 Masuk queue (${queue.length})`);
+  bot.sendMessage(msg.chat.id, `📥 Queue: ${queue.length}`);
   runQueue();
 }
 
 /* ================= COMMANDS ================= */
 bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(
-    msg.chat.id,
-    "👋 Downloader Bot\nKirim link YT / FB / IG / TikTok"
-  );
+  bot.sendMessage(msg.chat.id, "👋 Kirim link YT / FB / IG / TikTok");
 });
 
 bot.onText(/\/stats/, (msg) => {
-  const uptime = Math.floor((Date.now() - stats.start) / 1000);
+  const up = Math.floor((Date.now() - stats.start) / 1000);
   bot.sendMessage(
     msg.chat.id,
     `📊 Statistik
-⏱ Uptime: ${uptime}s
+⏱ Uptime: ${up}s
 📥 Total: ${stats.total}
 ✅ Sukses: ${stats.success}
 ❌ Gagal: ${stats.failed}
@@ -166,265 +154,4 @@ bot.on("message", (msg) => {
 process.on("unhandledRejection", console.error);
 process.on("uncaughtException", console.error);
 
-console.log("✅ Bot RUNNING (stable, queue enabled)");/* ================= STATS ================= */
-const stats = {
-  start: Date.now(),
-  total: 0,
-  success: 0,
-  failed: 0,
-};
-
-/* ================= UTILS ================= */
-const isAdmin = (id) => id === ADMIN_ID;
-
-function detectPlatform(url) {
-  if (/youtu\.?be/.test(url)) return "YouTube";
-  if (/tiktok\.com/.test(url)) return "TikTok";
-  if (/instagram\.com/.test(url)) return "Instagram";
-  if (/facebook\.com|fb\.watch/.test(url)) return "Facebook";
-  return "Unknown";
-}
-
-function allowRequest(userId) {
-  if (isAdmin(userId)) return true;
-  const last = cooldown.get(userId) || 0;
-  const now = Date.now();
-  if (now - last < USER_DELAY * 1000) return false;
-  cooldown.set(userId, now);
-  return true;
-}
-
-function buildYtDlpCmd(url) {
-  // Auto detect resolusi terbaik <=1080p
-  return `yt-dlp -f "bv*[height<=1080]/bv*+ba/b" --merge-output-format mp4 -o "${DOWNLOAD_DIR}/%(id)s.%(ext)s" "${url}"`;
-}
-
-/* ================= QUEUE PROCESSOR ================= */
-async function processQueue() {
-  if (processing || queue.length === 0) return;
-
-  processing = true;
-  const job = queue.shift();
-  const { msg, url } = job;
-  const chatId = msg.chat.id;
-
-  try {
-    const platform = detectPlatform(url);
-    await bot.sendMessage(
-      chatId,
-      `⏳ Memproses *${platform}*\n🧠 Sisa antrian: ${queue.length}`,
-      { parse_mode: "Markdown" }
-    );
-
-    exec(buildYtDlpCmd(url), async (err) => {
-      if (err) {
-        stats.failed++;
-        console.error("yt-dlp error:", err);
-        await bot.sendMessage(chatId, "❌ Gagal download");
-        processing = false;
-        return processQueue();
-      }
-
-      const file = fs.readdirSync(DOWNLOAD_DIR).find(f => f.endsWith(".mp4"));
-      if (!file) {
-        stats.failed++;
-        await bot.sendMessage(chatId, "❌ File tidak ditemukan");
-        processing = false;
-        return processQueue();
-      }
-
-      const filePath = path.join(DOWNLOAD_DIR, file);
-      cache.set(url, filePath);
-      stats.success++;
-
-      await bot.sendVideo(chatId, filePath);
-      fs.unlinkSync(filePath);
-
-      processing = false;
-      processQueue();
-    });
-
-  } catch (e) {
-    stats.failed++;
-    console.error(e);
-    processing = false;
-    processQueue();
-  }
-}
-
-/* ================= ENQUEUE ================= */
-async function enqueue(msg, url) {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-
-  if (!allowRequest(userId)) {
-    return bot.sendMessage(chatId, "⏳ Tunggu sebentar sebelum request lagi");
-  }
-
-  if (cache.has(url)) {
-    return bot.sendVideo(chatId, cache.get(url));
-  }
-
-  // Admin masuk antrian paling depan
-  if (isAdmin(userId)) {
-    queue.unshift({ msg, url });
-  } else {
-    queue.push({ msg, url });
-  }
-
-  await bot.sendMessage(
-    chatId,
-    `📥 Masuk antrian\n📍 Posisi: ${queue.length}`
-  );
-
-  processQueue();
-}
-
-/* ================= COMMANDS ================= */
-bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(
-    msg.chat.id,
-    "👋 *Downloader Bot Aktif*\n\nKirim link YT / FB / IG / TikTok",
-    { parse_mode: "Markdown" }
-  );
-});
-
-bot.onText(/\/stats/, (msg) => {
-  const uptime = Math.floor((Date.now() - stats.start) / 1000);
-  const text =
-`📊 *STATISTIK BOT*
-⏱ Uptime : ${uptime}s
-📥 Total  : ${stats.total}
-✅ Sukses : ${stats.success}
-❌ Gagal  : ${stats.failed}
-🧠 Queue  : ${queue.length}
-💾 Cache  : ${cache.size}`;
-  bot.sendMessage(msg.chat.id, text, { parse_mode: "Markdown" });
-});
-
-/* ================= MESSAGE ================= */
-bot.on("message", async (msg) => {
-  if (!msg.text || msg.text.startsWith("/")) return;
-  if (!msg.text.startsWith("http")) return;
-
-  stats.total++;
-  await enqueue(msg, msg.text.trim());
-});
-
-/* ================= SAFETY ================= */
-process.on("unhandledRejection", console.error);
-process.on("uncaughtException", console.error);
-
-console.log("✅ Bot running (QUEUE + yt-dlp stable)");  return "Unknown"
-}
-
-function canRequest(userId) {
-  if (isAdmin(userId)) return true
-  const last = userCooldown.get(userId) || 0
-  const now = Date.now()
-  if (now - last < globalCooldown * 1000) return false
-  userCooldown.set(userId, now)
-  return true
-}
-
-function buildCmd(url) {
-  return `yt-dlp -f "bv*[height<=1080]+ba/b[height<=1080]" --merge-output-format mp4 -o "${DOWNLOAD_DIR}/%(id)s.%(ext)s" "${url}"`
-}
-
-// ===== QUEUE PROCESSOR =====
-async function processQueue() {
-  if (isProcessing || queue.length === 0) return
-
-  isProcessing = true
-  const job = queue.shift()
-
-  const { msg, url } = job
-  const chatId = msg.chat.id
-  const platform = detectPlatform(url)
-
-  try {
-    await bot.sendMessage(chatId, `⏳ Memproses (${platform})...\n📥 Antrian tersisa: ${queue.length}`)
-
-    exec(buildCmd(url), async err => {
-      if (err) {
-        globalCooldown = Math.min(globalCooldown + 10, 60)
-        await bot.sendMessage(chatId, "❌ Gagal download")
-        isProcessing = false
-        processQueue()
-        return
-      }
-
-      const file = fs.readdirSync(DOWNLOAD_DIR).find(f => f.endsWith(".mp4"))
-      if (!file) {
-        await bot.sendMessage(chatId, "❌ File tidak ditemukan")
-        isProcessing = false
-        processQueue()
-        return
-      }
-
-      const filePath = path.join(DOWNLOAD_DIR, file)
-      cache.set(url, filePath)
-
-      await bot.sendVideo(chatId, filePath)
-      fs.unlinkSync(filePath)
-
-      isProcessing = false
-      processQueue()
-    })
-  } catch (e) {
-    console.error(e)
-    isProcessing = false
-    processQueue()
-  }
-}
-
-// ===== HANDLER =====
-async function enqueueDownload(msg, url) {
-  const chatId = msg.chat.id
-  const userId = msg.from.id
-
-  if (!canRequest(userId)) {
-    return bot.sendMessage(chatId, "⏳ Slow down...")
-  }
-
-  if (cache.has(url)) {
-    return bot.sendVideo(chatId, cache.get(url))
-  }
-
-  queue.push({ msg, url })
-  await bot.sendMessage(chatId, `📥 Ditambahkan ke antrian\n🧠 Posisi: ${queue.length}`)
-
-  processQueue()
-}
-
-// ===== COMMANDS =====
-bot.onText(/\/start/, async msg => {
-  await bot.sendMessage(msg.chat.id, "👋 Kirim link video (YT / FB / IG / TikTok)")
-})
-
-bot.onText(/\/stats/, async msg => {
-  await bot.sendMessage(
-    msg.chat.id,
-    `📊 *Statistik Bot*
-👥 User aktif: ${userCooldown.size}
-🧠 Antrian: ${queue.length}
-💾 Cache: ${cache.size}
-⏱ Cooldown: ${globalCooldown}s`,
-    { parse_mode: "Markdown" }
-  )
-})
-
-// ===== MESSAGE =====
-bot.on("message", async msg => {
-  if (!msg.text) return
-  if (msg.text.startsWith("/")) return
-  if (!msg.text.startsWith("http")) return
-
-  await enqueueDownload(msg, msg.text.trim())
-})
-
-// ===== SAFETY =====
-process.on("unhandledRejection", console.error)
-process.on("uncaughtException", console.error)
-
-console.log("✅ Bot running with QUEUE...")
+console.log("✅ Bot RUNNING — clean & stable");
