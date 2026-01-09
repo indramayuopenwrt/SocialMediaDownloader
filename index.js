@@ -1,182 +1,119 @@
 import TelegramBot from "node-telegram-bot-api";
-import { exec } from "child_process";
+import YTDlpWrap from "ytdlp-wrap";
 import fs from "fs";
-import crypto from "crypto";
+import path from "path";
+import LRU from "lru-cache";
 
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
+const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_ID = Number(process.env.ADMIN_ID);
-const CACHE_DIR = "./cache";
 
-if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR);
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+const ytdlp = new YTDlpWrap("/usr/bin/yt-dlp");
 
-// ================= DATA =================
 const cooldown = new Map();
-const userLinks = new Map();
-
 const stats = {
-  totalRequest: 0,
-  success: 0,
-  cacheHit: 0,
-  users: new Set(),
-  platform: { YouTube: 0, TikTok: 0, Instagram: 0, Facebook: 0 },
-  startTime: Date.now()
+  total: 0,
+  error: 0,
+  window: []
 };
 
-let errorCount = 0;
-let errorWindowStart = Date.now();
-let alertSent = false;
-let dynamicCooldown = 15000;
+const cache = new LRU({ max: 50, ttl: 1000 * 60 * 10 });
 
-// ================= UTILS =================
-const detectPlatform = (url) => {
-  if (/youtube\.com|youtu\.be/.test(url)) return "YouTube";
-  if (/tiktok\.com/.test(url)) return "TikTok";
-  if (/instagram\.com/.test(url)) return "Instagram";
-  if (/facebook\.com|fb\.watch/.test(url)) return "Facebook";
-  return null;
-};
+let dynamicCooldown = 60000;
 
-const hash = (s) =>
-  crypto.createHash("md5").update(s).digest("hex");
-
-const uptime = () => {
-  const s = Math.floor((Date.now() - stats.startTime) / 1000);
-  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
-};
-
-function updateCooldown() {
-  const errorRate = stats.totalRequest
-    ? (errorCount / stats.totalRequest) * 100
-    : 0;
-
-  if (stats.totalRequest > 50) dynamicCooldown = 30000;
-  else if (errorRate > 20) dynamicCooldown = 60000;
-  else dynamicCooldown = 15000;
+function detectPlatform(url) {
+  if (/facebook|fb/.test(url)) return "Facebook";
+  if (/tiktok/.test(url)) return "TikTok";
+  if (/instagram|ig/.test(url)) return "Instagram";
+  if (/youtube|youtu/.test(url)) return "YouTube";
+  return "Unknown";
 }
 
-function checkErrorAlert() {
-  const now = Date.now();
-  if (now - errorWindowStart > 10 * 60 * 1000) {
-    errorCount = 0;
-    errorWindowStart = now;
-    alertSent = false;
-    return;
+function pickBestFormat(formats) {
+  const priorities = [1080, 720, 480, 360];
+  for (const res of priorities) {
+    const f = formats.find(v =>
+      v.height === res &&
+      v.vcodec !== "none" &&
+      v.acodec !== "none"
+    );
+    if (f) return f;
   }
+  return formats.find(v => v.vcodec !== "none" && v.acodec !== "none");
+}
 
-  const errorRate = stats.totalRequest
-    ? (errorCount / stats.totalRequest) * 100
-    : 0;
+function updateStats(error = false) {
+  const now = Date.now();
+  stats.total++;
+  if (error) stats.error++;
+  stats.window.push({ time: now, error });
+  stats.window = stats.window.filter(x => now - x.time < 600000);
 
-  if (!alertSent && (errorCount >= 5 || errorRate >= 30)) {
-    alertSent = true;
-    bot.sendMessage(
-      ADMIN_ID,
-      `🚨 ALERT BOT ERROR\n\n❌ Error: ${errorCount}\n📥 Request: ${stats.totalRequest}\n📊 Error Rate: ${errorRate.toFixed(
-        1
-      )}%\n⏱ Window: 10 menit`
+  const errors = stats.window.filter(x => x.error).length;
+  const total = stats.window.length;
+  const rate = total ? (errors / total) * 100 : 0;
+
+  if (rate > 50) dynamicCooldown = 120000;
+  else dynamicCooldown = 60000;
+
+  if (rate > 70) {
+    bot.sendMessage(ADMIN_ID,
+      `🚨 ALERT BOT ERROR\n❌ Error: ${errors}\n📦 Request: ${total}\n📊 Error Rate: ${rate.toFixed(1)}%\n⏱ Window: 10 menit`
     );
   }
 }
 
-// ================= MESSAGE =================
-bot.on("message", (msg) => {
+bot.on("message", async msg => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
-  const text = msg.text;
-
-  if (!text) return;
-
-  // ===== ADMIN STATS =====
-  if (text === "/stats" && userId === ADMIN_ID) {
-    return bot.sendMessage(
-      chatId,
-      `📊 BOT STATS
-
-👥 Users: ${stats.users.size}
-📥 Total: ${stats.totalRequest}
-✅ Success: ${stats.success}
-⚡ Cache: ${stats.cacheHit}
-🚨 Error: ${errorCount}
-
-🌍 Platform:
-YT ${stats.platform.YouTube}
-TT ${stats.platform.TikTok}
-IG ${stats.platform.Instagram}
-FB ${stats.platform.Facebook}
-
-⏱ Uptime: ${uptime()}
-⛔ Cooldown: ${dynamicCooldown / 1000}s`
-    );
-  }
+  const text = msg.text || "";
 
   if (!text.startsWith("http")) return;
 
-  updateCooldown();
-  const last = cooldown.get(userId);
-  if (last && Date.now() - last < dynamicCooldown) {
-    return bot.sendMessage(
-      chatId,
-      `⛔ Slow down\n⏱ ${dynamicCooldown / 1000}s`
-    );
-  }
-  cooldown.set(userId, Date.now());
-
-  const platform = detectPlatform(text);
-  if (!platform) return bot.sendMessage(chatId, "❌ Platform tidak didukung");
-
-  stats.totalRequest++;
-  stats.platform[platform]++;
-  stats.users.add(userId);
-  userLinks.set(userId, text);
-
-  bot.sendMessage(chatId, `📥 ${platform}\nPilih resolusi:`, {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "360p", callback_data: "360" }, { text: "480p", callback_data: "480" }],
-        [{ text: "720p", callback_data: "720" }, { text: "1080p", callback_data: "1080" }]
-      ]
+  // ADMIN BYPASS SLOW DOWN
+  if (userId !== ADMIN_ID) {
+    const last = cooldown.get(userId);
+    if (last && Date.now() - last < dynamicCooldown) {
+      return bot.sendMessage(chatId, `⛔ Slow down\n⏱ ${dynamicCooldown / 1000}s`);
     }
-  });
+    cooldown.set(userId, Date.now());
+  }
+
+  try {
+    const platform = detectPlatform(text);
+    await bot.sendMessage(chatId, `⬇️ Memproses ${platform}\n🎞 Resolusi terbaik dipilih otomatis`);
+
+    if (cache.has(text)) {
+      return bot.sendVideo(chatId, cache.get(text));
+    }
+
+    const info = await ytdlp.getInfo(text);
+    const format = pickBestFormat(info.formats);
+    if (!format) throw new Error("Format tidak ditemukan");
+
+    const file = `downloads/${Date.now()}.mp4`;
+    fs.mkdirSync("downloads", { recursive: true });
+
+    await ytdlp.exec([
+      text,
+      "-f", format.format_id,
+      "--merge-output-format", "mp4",
+      "-o", file
+    ]);
+
+    await bot.sendVideo(chatId, fs.createReadStream(file));
+    cache.set(text, fs.createReadStream(file));
+
+    updateStats(false);
+  } catch (e) {
+    updateStats(true);
+    bot.sendMessage(chatId, "❌ Gagal download");
+  }
 });
 
-// ================= CALLBACK =================
-bot.on("callback_query", (q) => {
-  const userId = q.from.id;
-  const chatId = q.message.chat.id;
-  const res = q.data;
-
-  const link = userLinks.get(userId);
-  if (!link) return;
-
-  const platform = detectPlatform(link);
-  const key = hash(link + res);
-  const output = `${CACHE_DIR}/${key}.mp4`;
-
-  if (fs.existsSync(output)) {
-    stats.cacheHit++;
-    stats.success++;
-    bot.answerCallbackQuery(q.id);
-    return bot.sendVideo(chatId, fs.createReadStream(output), {
-      caption: `⚡ Cache | ${platform} ${res}p`
-    });
-  }
-
-  bot.answerCallbackQuery(q.id, { text: "⏳ Downloading..." });
-
-  exec(
-    `yt-dlp -f "bestvideo[height<=${res}]+bestaudio/best" --merge-output-format mp4 -o "${output}" "${link}"`,
-    (err) => {
-      if (err) {
-        errorCount++;
-        checkErrorAlert();
-        return bot.sendMessage(chatId, "❌ Gagal download");
-      }
-      stats.success++;
-      bot.sendVideo(chatId, fs.createReadStream(output), {
-        caption: `✅ ${platform} ${res}p | No Watermark`
-      });
-    }
+bot.onText(/\/stats/, msg => {
+  if (msg.from.id !== ADMIN_ID) return;
+  bot.sendMessage(msg.chat.id,
+    `📊 Statistik Bot\n📦 Total: ${stats.total}\n❌ Error: ${stats.error}\n👑 Admin bypass: ON`
   );
 });
-
-console.log("🚀 Bot aktif");
