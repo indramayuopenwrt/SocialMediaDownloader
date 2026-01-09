@@ -1,16 +1,10 @@
-FROM node:18-bullseye
+FROM node:20-slim
+
+RUN apt update && apt install -y ffmpeg curl python3
+RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/bin/yt-dlp
+RUN chmod +x /usr/bin/yt-dlp
 
 WORKDIR /app
-
-# Install ffmpeg + curl
-RUN apt update && apt install -y ffmpeg curl
-
-# Install yt-dlp binary (AMAN)
-RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
-    -o /usr/local/bin/yt-dlp && \
-    chmod +x /usr/local/bin/yt-dlp
-
-# Install Node deps
 COPY package.json .
 RUN npm install
 
