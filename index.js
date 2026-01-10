@@ -1,71 +1,79 @@
 /**
- * AutoClipYT Telegram Downloader Bot
- * FINAL FIX VERSION
- * Node.js + yt-dlp
+ * TELEGRAM AUTO DOWNLOADER BOT
+ * FINAL STABLE VERSION
+ * Node 20 + Railway SAFE
  */
 
 const TelegramBot = require("node-telegram-bot-api");
 const { execFile } = require("child_process");
 const fs = require("fs");
 const path = require("path");
-const LRU = require("lru-cache");
+const { LRUCache } = require("lru-cache");
 const PQueue = require("p-queue").default;
 
-// ================= CONFIG =================
+/* ================= ENV ================= */
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const ADMIN_IDS = (process.env.ADMIN_IDS || "").split(",").map(Number);
-const DOWNLOAD_DIR = "/tmp";
+const ADMIN_IDS = (process.env.ADMIN_IDS || "")
+  .split(",")
+  .map((x) => Number(x.trim()))
+  .filter(Boolean);
 
-// ================= BOT =================
+if (!BOT_TOKEN) {
+  console.error("❌ BOT_TOKEN belum di set");
+  process.exit(1);
+}
+
+/* ================= CONST ================= */
+const DOWNLOAD_DIR = "/tmp";
+const COOKIE_FILE = "cookies.txt";
+
+/* ================= BOT ================= */
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-// ================= CACHE =================
-const cache = new LRU({
+/* ================= CACHE ================= */
+const cache = new LRUCache({
   max: 500,
   ttl: 1000 * 60 * 30, // 30 menit
 });
 
-// ================= QUEUE =================
+/* ================= QUEUE ================= */
 const queue = new PQueue({
   concurrency: 1,
-  intervalCap: 5,
-  interval: 1000,
 });
 
-// ================= STATS =================
-const botStats = {
+/* ================= STATS ================= */
+const stats = {
   total: 0,
   success: 0,
   failed: 0,
 };
 
-// ================= UTILS =================
-function isAdmin(id) {
-  return ADMIN_IDS.includes(id);
-}
+/* ================= UTIL ================= */
+const isAdmin = (id) => ADMIN_IDS.includes(id);
 
 function detectPlatform(url) {
-  if (/tiktok\.com/.test(url)) return "tiktok";
-  if (/youtu\.be|youtube\.com/.test(url)) return "youtube";
-  if (/facebook\.com|fb\.watch/.test(url)) return "facebook";
-  if (/instagram\.com/.test(url)) return "instagram";
+  if (/tiktok\.com/i.test(url)) return "tiktok";
+  if (/youtu\.be|youtube\.com/i.test(url)) return "youtube";
+  if (/facebook\.com|fb\.watch/i.test(url)) return "facebook";
+  if (/instagram\.com/i.test(url)) return "instagram";
   return "unknown";
 }
 
-function checkPrivate(url) {
+/* ================= FB PRIVATE CHECK ================= */
+function checkFBPrivate(url) {
   return new Promise((resolve) => {
     execFile(
       "yt-dlp",
-      ["--dump-json", "--no-playlist", url],
+      ["--cookies", COOKIE_FILE, "--dump-json", "--no-playlist", url],
       (err, stdout, stderr) => {
         if (!err) return resolve(false);
 
         const msg = (stderr || "").toLowerCase();
         if (
-          msg.includes("private") ||
           msg.includes("login") ||
-          msg.includes("not available") ||
-          msg.includes("content isn't available")
+          msg.includes("private") ||
+          msg.includes("checkpoint") ||
+          msg.includes("not available")
         ) {
           return resolve(true);
         }
@@ -75,47 +83,67 @@ function checkPrivate(url) {
   });
 }
 
-function autoFormat(platform) {
-  if (platform === "youtube")
-    return "bestvideo[height<=1080]+bestaudio/best";
-  return "best";
+/* ================= FORMAT AUTO ================= */
+function getFormat(platform) {
+  if (platform === "youtube") {
+    return [
+      "bv*[height<=1080]+ba/b",
+      "bv*[height<=720]+ba/b",
+      "b",
+    ];
+  }
+  return ["b"];
 }
 
-// ================= DOWNLOAD =================
-async function downloadVideo(url, platform) {
-  const out = path.join(DOWNLOAD_DIR, `${Date.now()}.mp4`);
-  const format = autoFormat(platform);
+/* ================= DOWNLOAD ================= */
+function downloadVideo(url, platform) {
+  const output = path.join(DOWNLOAD_DIR, `${Date.now()}.mp4`);
+  const formats = getFormat(platform);
 
   return new Promise((resolve, reject) => {
-    execFile(
-      "yt-dlp",
-      [
+    const tryFormat = (i) => {
+      if (i >= formats.length) return reject("FORMAT_FAILED");
+
+      const args = [
         "-f",
-        format,
+        formats[i],
         "--merge-output-format",
         "mp4",
         "--no-playlist",
+        "--retries",
+        "3",
+        "--fragment-retries",
+        "3",
+        "--concurrent-fragments",
+        "1",
         "-o",
-        out,
+        output,
         url,
-      ],
-      { timeout: 1000 * 60 * 5 },
-      (err) => {
-        if (err) return reject(err);
-        resolve(out);
+      ];
+
+      if (platform === "facebook" && fs.existsSync(COOKIE_FILE)) {
+        args.unshift("--cookies", COOKIE_FILE);
       }
-    );
+
+      execFile("yt-dlp", args, { timeout: 1000 * 60 * 5 }, (err) => {
+        if (!err) return resolve(output);
+        tryFormat(i + 1);
+      });
+    };
+
+    tryFormat(0);
   });
 }
 
-// ================= BOT COMMANDS =================
+/* ================= COMMANDS ================= */
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    "👋 *AutoClipYT*\n\n" +
+    "👋 *Downloader Bot*\n\n" +
       "📥 Kirim link:\n" +
-      "YouTube / TikTok / Facebook / Instagram\n\n" +
-      "⚡ Auto detect platform & resolusi",
+      "YouTube / TikTok / Instagram / Facebook\n\n" +
+      "⚡ Auto detect resolusi\n" +
+      "🧠 Queue anti crash",
     { parse_mode: "Markdown" }
   );
 });
@@ -125,55 +153,54 @@ bot.onText(/\/stats/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
     `📊 *BOT STATS*\n\n` +
-      `📥 Total: ${botStats.total}\n` +
-      `✅ Success: ${botStats.success}\n` +
-      `❌ Failed: ${botStats.failed}\n` +
+      `📥 Total: ${stats.total}\n` +
+      `✅ Success: ${stats.success}\n` +
+      `❌ Failed: ${stats.failed}\n` +
       `🧠 Queue: ${queue.size}`,
     { parse_mode: "Markdown" }
   );
 });
 
-// ================= MESSAGE HANDLER =================
+/* ================= MESSAGE ================= */
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text || "";
 
-  if (!/^https?:\/\//.test(text)) return;
+  if (!/^https?:\/\//i.test(text)) return;
 
-  const userId = msg.from.id;
   const platform = detectPlatform(text);
-
   if (platform === "unknown") {
     bot.sendMessage(chatId, "❌ Platform tidak didukung");
     return;
   }
 
-  // Cache anti spam
-  if (!isAdmin(userId) && cache.has(text)) {
+  if (!isAdmin(msg.from.id) && cache.has(text)) {
     bot.sendMessage(chatId, "⏳ Link ini sedang / sudah diproses");
     return;
   }
-  cache.set(text, true);
 
-  bot.sendMessage(chatId, `⏳ Processing *${platform}*\n📦 Queue: ${queue.size}`, {
-    parse_mode: "Markdown",
-  });
+  cache.set(text, true);
+  stats.total++;
+
+  bot.sendMessage(
+    chatId,
+    `⏳ Processing *${platform}*\n📦 Queue: ${queue.size + 1}`,
+    { parse_mode: "Markdown" }
+  );
 
   queue.add(async () => {
-    botStats.total++;
-
     try {
-      if (platform === "facebook") {
-        const isPrivate = await checkPrivate(text);
+      if (platform === "facebook" && fs.existsSync(COOKIE_FILE)) {
+        const isPrivate = await checkFBPrivate(text);
         if (isPrivate) {
           bot.sendMessage(
             chatId,
             "🔒 Video Facebook *PRIVATE / LOGIN REQUIRED*\n\n" +
-              "❌ Tidak bisa di-download oleh bot.\n" +
-              "✅ Pastikan video *Public*",
+              "❌ Tidak bisa diproses.\n" +
+              "✅ Pastikan akun FB valid & cookie aktif",
             { parse_mode: "Markdown" }
           );
-          botStats.failed++;
+          stats.failed++;
           return;
         }
       }
@@ -181,11 +208,12 @@ bot.on("message", async (msg) => {
       const file = await downloadVideo(text, platform);
       await bot.sendVideo(chatId, fs.createReadStream(file));
       fs.unlinkSync(file);
-
-      botStats.success++;
+      stats.success++;
     } catch (e) {
-      botStats.failed++;
-      bot.sendMessage(chatId, "❌ Download gagal (sumber membatasi akses)");
+      stats.failed++;
+      bot.sendMessage(chatId, "❌ Download gagal (dibatasi sumber)");
     }
   });
 });
+
+console.log("✅ Bot running & stable");
