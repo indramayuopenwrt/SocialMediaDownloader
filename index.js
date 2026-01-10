@@ -1,169 +1,205 @@
-const TelegramBot = require("node-telegram-bot-api");
-const { spawn } = require("child_process");
-const fs = require("fs");
-const path = require("path");
+/* ================= CONFIG ================= */
+const TelegramBot = require('node-telegram-bot-api')
+const { spawn } = require('child_process')
+const fs = require('fs')
+const path = require('path')
 
-const BOT_TOKEN = process.env.BOT_TOKEN;
-if (!BOT_TOKEN) {
-  console.error("BOT_TOKEN kosong");
-  process.exit(1);
+const BOT_TOKEN = process.env.BOT_TOKEN
+const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').map(x => x.trim())
+const COOKIES_PATH = './cookies.txt'
+const DOWNLOAD_DIR = './downloads'
+const MAX_DAILY = 10
+
+if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR)
+
+const bot = new TelegramBot(BOT_TOKEN, { polling: true })
+
+/* ================= MEMORY ================= */
+const stats = {
+  total: 0,
+  users: new Set()
 }
+const userLimit = {}
+const metaCache = new Map()
 
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-
-const DOWNLOAD_DIR = "./downloads";
-if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR);
-
-/* ========= ADMIN & LIMIT ========= */
-const ADMINS = [123456789]; // GANTI ID KAMU
-const DAILY_LIMIT = 10;
-const usage = new Map();
+/* ================= UTILS ================= */
+const sleep = ms => new Promise(r => setTimeout(r, ms))
 
 function isAdmin(id) {
-  return ADMINS.includes(id);
+  return ADMIN_IDS.includes(String(id))
 }
 
-function allow(id) {
-  if (isAdmin(id)) return true;
-  const today = new Date().toDateString();
-  const u = usage.get(id) || { date: today, count: 0 };
-  if (u.date !== today) {
-    u.date = today;
-    u.count = 0;
-  }
-  if (u.count >= DAILY_LIMIT) return false;
-  u.count++;
-  usage.set(id, u);
-  return true;
+function progressBar(percent, size = 10) {
+  const filled = Math.round((percent / 100) * size)
+  return '█'.repeat(filled) + '░'.repeat(size - filled)
 }
 
-/* ========= STAT ========= */
-const STAT = {
-  request: 0,
-  success: 0,
-  failed: 0,
-  users: new Set()
-};
-
-/* ========= UTIL ========= */
-function platform(url) {
-  if (/youtu/.test(url)) return "YouTube";
-  if (/tiktok/.test(url)) return "TikTok";
-  if (/facebook|fb\.watch/.test(url)) return "Facebook";
-  if (/instagram/.test(url)) return "Instagram";
-  return "Unknown";
+function detectPlatform(url) {
+  if (/tiktok\.com/.test(url)) return 'TikTok'
+  if (/facebook\.com|fb\.watch/.test(url)) return 'Facebook'
+  if (/youtu\.be|youtube\.com/.test(url)) return 'YouTube'
+  if (/instagram\.com/.test(url)) return 'Instagram'
+  return 'Unknown'
 }
 
-function size(bytes) {
-  if (!bytes) return "-";
-  return (bytes / 1024 / 1024).toFixed(2) + " MB";
-}
+/* ================= COMMANDS ================= */
+bot.onText(/\/start/, msg => {
+  bot.sendMessage(msg.chat.id, `
+👋 *SocialMediaDownloader Bot*
 
-/* ========= METADATA ========= */
-function metadata(url) {
-  return new Promise((resolve, reject) => {
-    const y = spawn("yt-dlp", [
-      "-j",
-      "--no-playlist",
-      "--cookies", "cookies.txt",
-      url
-    ]);
+📥 Kirim link:
+• YouTube
+• Facebook
+• TikTok
+• Instagram
 
-    let out = "";
-    y.stdout.on("data", d => out += d);
-    y.on("close", c => {
-      if (c !== 0) return reject();
-      try {
-        resolve(JSON.parse(out));
-      } catch {
-        reject();
-      }
-    });
-  });
-}
-
-/* ========= DOWNLOAD ========= */
-function download(url) {
-  return new Promise((resolve, reject) => {
-    const file = path.join(DOWNLOAD_DIR, `${Date.now()}.mp4`);
-
-    const y = spawn("yt-dlp", [
-      "-f",
-      "bv*[height<=1080]+ba/best[height<=1080]/best",
-      "--merge-output-format", "mp4",
-      "--cookies", "cookies.txt",
-      "-o", file,
-      url
-    ]);
-
-    y.on("close", c => {
-      if (c !== 0) return reject();
-      resolve(file);
-    });
-  });
-}
-
-/* ========= COMMAND ========= */
-bot.onText(/\/start|\/help/, msg => {
-  bot.sendMessage(msg.chat.id,
-`👋 Social Media Downloader
-
-📥 Kirim link video:
-YouTube, Facebook, TikTok, Instagram
-
-⚙ Fitur:
+✨ Fitur:
 • Auto kualitas terbaik (≤1080p)
 • Auto kirim DOCUMENT
+• Progress bar realtime
+• Metadata + caption
 • Admin bypass limit
 
-📊 /stats`);
-});
+📊 /stats – Statistik bot
+`, { parse_mode: 'Markdown' })
+})
 
 bot.onText(/\/stats/, msg => {
-  bot.sendMessage(msg.chat.id,
-`📊 Statistik Bot
-👥 User: ${STAT.users.size}
-📥 Request: ${STAT.request}
-✅ Sukses: ${STAT.success}
-❌ Gagal: ${STAT.failed}`);
-});
+  bot.sendMessage(msg.chat.id, `
+📊 *STATISTIK BOT*
+• Total download: ${stats.total}
+• Total user: ${stats.users.size}
+`, { parse_mode: 'Markdown' })
+})
 
-/* ========= MAIN ========= */
-bot.on("message", async msg => {
-  if (!msg.text || msg.text.startsWith("/")) return;
+/* ================= MAIN HANDLER ================= */
+bot.on('message', async msg => {
+  if (!msg.text || msg.text.startsWith('/')) return
 
-  const url = msg.text.trim();
-  if (!/^https?:\/\//.test(url)) return;
+  const chatId = msg.chat.id
+  const userId = msg.from.id
+  const url = msg.text.trim()
 
-  const uid = msg.from.id;
-  if (!allow(uid)) {
-    return bot.sendMessage(msg.chat.id, "⛔ Limit harian tercapai");
+  if (!/^https?:\/\//.test(url)) return
+
+  stats.users.add(userId)
+
+  if (!isAdmin(userId)) {
+    userLimit[userId] = (userLimit[userId] || 0) + 1
+    if (userLimit[userId] > MAX_DAILY) {
+      return bot.sendMessage(chatId, '⛔ Limit harian tercapai')
+    }
   }
 
-  STAT.request++;
-  STAT.users.add(uid);
+  stats.total++
 
-  const p = platform(url);
-  await bot.sendMessage(msg.chat.id, `⏳ Memproses ${p}...`);
+  const platform = detectPlatform(url)
 
-  try {
-    const info = await metadata(url);
+  const statusMsg = await bot.sendMessage(chatId, `
+⏳ Memproses ${platform}...
+░░░░░░░░░░ 0%
+📦 --
+⚡ --
+⏱ --
+`)
 
-    await bot.sendMessage(msg.chat.id,
-`📥 ${info.title || "Tanpa Judul"}
-🌍 ${p}
-⏱ ${info.duration || "-"} detik`);
+  const outFile = path.join(
+    DOWNLOAD_DIR,
+    `${Date.now()}_${Math.random().toString(36).slice(2)}.mp4`
+  )
 
-    const file = await download(url);
-    await bot.sendDocument(msg.chat.id, file);
-    fs.unlinkSync(file);
+  const args = [
+    url,
+    '-f',
+    'bv*[height<=1080]/bv*+ba/best',
+    '--merge-output-format', 'mp4',
+    '--newline',
+    '--cookies', COOKIES_PATH,
+    '-o', outFile,
+    '--print', '%(title)s',
+    '--print', '%(duration)s',
+    '--print', '%(uploader)s',
+    '--print', '%(view_count)s'
+  ]
 
-    STAT.success++;
-  } catch (e) {
-    console.error(e);
-    STAT.failed++;
-    bot.sendMessage(msg.chat.id, "❌ Gagal download video");
-  }
-});
+  const ytdlp = spawn('yt-dlp', args)
 
-console.log("✅ BOT RUNNING (FINAL FIX)");
+  let lastUpdate = 0
+  let meta = {}
+
+  ytdlp.stdout.on('data', async data => {
+    const text = data.toString()
+
+    // METADATA CACHE
+    if (!meta.title && !text.startsWith('[download]')) {
+      const lines = text.trim().split('\n')
+      if (lines.length >= 4) {
+        meta = {
+          title: lines[0],
+          duration: lines[1],
+          uploader: lines[2],
+          views: lines[3]
+        }
+        metaCache.set(url, meta)
+      }
+    }
+
+    // PROGRESS
+    const m = text.match(
+      /(\d+\.\d+)%.*?of\s+([\d.]+)(MiB|GiB).*?at\s+([\d.]+)(MiB|KiB)\/s.*?ETA\s+(\d+:\d+)/
+    )
+    if (!m) return
+
+    const now = Date.now()
+    if (now - lastUpdate < 5000) return
+    lastUpdate = now
+
+    const percent = parseFloat(m[1])
+    const bar = progressBar(percent)
+
+    try {
+      await bot.editMessageText(`
+⏳ Download ${platform}
+${bar} ${percent.toFixed(0)}%
+📦 ${m[2]} ${m[3]}
+⚡ ${m[4]} ${m[5]}/s
+⏱ ${m[6]}
+`, {
+        chat_id: chatId,
+        message_id: statusMsg.message_id
+      })
+    } catch {}
+  })
+
+  ytdlp.on('close', async code => {
+    if (code !== 0 || !fs.existsSync(outFile)) {
+      return bot.sendMessage(chatId, '❌ Gagal download')
+    }
+
+    await bot.editMessageText(`
+✅ Download selesai
+██████████ 100%
+📤 Mengirim file...
+`, {
+      chat_id: chatId,
+      message_id: statusMsg.message_id
+    })
+
+    const caption = `
+📥 *${meta.title || 'Video'}*
+🌐 Platform: ${platform}
+👤 ${meta.uploader || '-'}
+👁 ${meta.views || '-'} views
+⏱ ${meta.duration || '-'} detik
+`
+
+    await bot.sendDocument(chatId, outFile, {
+      caption,
+      parse_mode: 'Markdown'
+    })
+
+    fs.unlinkSync(outFile)
+  })
+})
+
+console.log('✅ BOT RUNNING (COMMONJS)')
