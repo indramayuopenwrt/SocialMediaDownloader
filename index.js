@@ -1,12 +1,12 @@
-import TelegramBot from "node-telegram-bot-api";
-import { spawn } from "child_process";
-import fs from "fs";
-import path from "path";
+const TelegramBot = require("node-telegram-bot-api");
+const { spawn } = require("child_process");
+const fs = require("fs");
+const path = require("path");
 
 /* ================= CONFIG ================= */
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) {
-  console.error("BOT_TOKEN belum di set");
+  console.error("❌ BOT_TOKEN belum di set");
   process.exit(1);
 }
 
@@ -109,8 +109,6 @@ function getMetadata(url) {
 
     let out = "";
     ytdlp.stdout.on("data", d => out += d.toString());
-    ytdlp.stderr.on("data", () => {});
-
     ytdlp.on("close", code => {
       if (code !== 0) return reject("metadata error");
       try {
@@ -160,7 +158,7 @@ function downloadVideo(url, format) {
 
 /* ================= WELCOME ================= */
 const WELCOME = `
-👋 *Welcome Social Downloader Bot*
+👋 Welcome Social Downloader Bot
 
 📥 Kirim link video untuk download otomatis
 
@@ -183,19 +181,18 @@ const WELCOME = `
 
 /* ================= COMMAND ================= */
 bot.onText(/\/start|\/help/, msg => {
-  bot.sendMessage(msg.chat.id, WELCOME, { parse_mode: "Markdown" });
+  bot.sendMessage(msg.chat.id, WELCOME);
 });
 
 bot.onText(/\/stats/, msg => {
   bot.sendMessage(msg.chat.id,
-`📊 *Statistik Bot*
+`📊 Statistik Bot
 
 👥 User: ${STATS.users.size}
 📥 Request: ${STATS.request}
 ✅ Sukses: ${STATS.success}
 ❌ Gagal: ${STATS.failed}
-🧠 Cache hit: ${STATS.cacheHit}`,
-{ parse_mode: "Markdown" });
+🧠 Cache hit: ${STATS.cacheHit}`);
 });
 
 /* ================= MAIN ================= */
@@ -223,22 +220,17 @@ bot.on("message", async msg => {
     if (!format) throw "format kosong";
 
     await bot.sendMessage(msg.chat.id,
-`📥 *${info.title || "Tanpa Judul"}*
+`📥 ${info.title || "Tanpa Judul"}
 🌍 ${platform}
 🎞 ${format.height}p
 📦 ${formatSize(format.filesize)}
-⏱ ${formatDuration(info.duration)}`,
-{ parse_mode: "Markdown" });
+⏱ ${formatDuration(info.duration)}`);
 
     const file = await downloadVideo(url, format);
-
-    await bot.sendDocument(msg.chat.id, file, {
-      caption: info.title || ""
-    });
-
+    await bot.sendDocument(msg.chat.id, file);
     fs.unlinkSync(file);
-    STATS.success++;
 
+    STATS.success++;
   } catch (e) {
     console.error(e);
     STATS.failed++;
@@ -246,4 +238,4 @@ bot.on("message", async msg => {
   }
 });
 
-console.log("✅ BOT PRODUKSI AKTIF");
+console.log("✅ BOT RUNNING (COMMONJS)");
