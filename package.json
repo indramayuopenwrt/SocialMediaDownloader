@@ -1,5 +1,5 @@
 {
-  "name": "telegram-downloader-bot",
+  "name": "social-media-downloader-bot",
   "version": "1.0.0",
   "main": "index.js",
   "type": "commonjs",
@@ -7,7 +7,6 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "node-telegram-bot-api": "^0.66.0",
-    "p-queue": "^7.4.1"
+    "node-telegram-bot-api": "^0.63.0"
   }
 }
