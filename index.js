@@ -1,12 +1,19 @@
-import TelegramBot from 'node-telegram-bot-api';
-import { exec } from 'child_process';
-import fs from 'fs';
-import path from 'path';
-import crypto from 'crypto';
+const TelegramBot = require('node-telegram-bot-api');
+const { exec } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
 
+/* ================= ENV ================= */
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').map(Number);
 const COOKIES = process.env.COOKIES || '';
+
+if (!BOT_TOKEN) {
+  console.error('❌ BOT_TOKEN belum di set');
+  process.exit(1);
+}
+
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
 /* ================= CONFIG ================= */
@@ -17,6 +24,7 @@ const CACHE_TTL = 1000 * 60 * 60;
 
 /* ================= STATE ================= */
 if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR);
+
 const queue = [];
 let running = 0;
 
@@ -27,6 +35,8 @@ const fileCache = new Map();
 /* ================= UTILS ================= */
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const hash = s => crypto.createHash('md5').update(s).digest('hex');
+
+const SPINNER_FRAMES = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
 
 function isAdmin(id) {
   return ADMIN_IDS.includes(id);
@@ -49,25 +59,10 @@ function cleanup() {
   }
 }
 
-/* ================= CAPTION FORMAT ================= */
-function buildCaption(meta) {
-  const l = [];
-  l.push(`ðŸŽ¬ ${meta.platform} Video`);
-  l.push('');
-
-  if (meta.author) l.push(`ðŸ‘¤ ${meta.author}`);
-  if (meta.description && meta.description !== meta.author)
-    l.push(`ðŸ“ ${meta.description}`);
-
-  if (meta.views || meta.likes) {
-    l.push('');
-    l.push(`ðŸ‘ï¸ ${meta.views || '-'} views   ðŸ‘ ${meta.likes || '-'}`);
-  }
-
-  l.push(`â±ï¸ ${meta.duration || '-'} detik`);
-  l.push(`ðŸ“¦ ${meta.size || '-'}`);
-
-  return l.join('\n');
+function progressBar(percent) {
+  const total = 20;
+  const filled = Math.round((percent / 100) * total);
+  return '█'.repeat(filled) + '░'.repeat(total - filled);
 }
 
 /* ================= PLATFORM ================= */
@@ -79,6 +74,65 @@ function detectPlatform(url) {
   return 'Video';
 }
 
+/* ================= CAPTION ================= */
+function buildCaption(meta) {
+  const lines = [];
+
+  lines.push(`🎬 ${meta.platform}`);
+  if (meta.author) lines.push(`👤 ${meta.author}`);
+
+  lines.push('');
+
+  if (meta.title) lines.push(`📌 ${meta.title}`);
+  if (meta.description && meta.description !== meta.title)
+    lines.push(`📝 ${meta.description}`);
+
+  lines.push('');
+
+  if (meta.views || meta.likes) {
+    lines.push(`👁️ ${meta.views || '-'}   👍 ${meta.likes || '-'}`);
+  }
+
+  lines.push(`⏱️ ${meta.duration || '-'} detik`);
+  lines.push(`📦 ${meta.size || '-'}`);
+
+  return lines.join('\n');
+}
+
+/* ================= META ================= */
+function extractMeta(url) {
+  if (metaCache.has(url)) return Promise.resolve(metaCache.get(url));
+
+  return new Promise(resolve => {
+    exec(`yt-dlp -j "${url}"`, (e, out) => {
+      if (e) return resolve({ platform: detectPlatform(url) });
+
+      const i = JSON.parse(out);
+      const meta = {
+        platform: detectPlatform(url),
+        title: i.title,
+        author: i.uploader || i.channel,
+        description: i.description
+          ? i.description.slice(0, 400)
+          : null,
+        views: i.view_count
+          ? `${Math.round(i.view_count / 1000)}K`
+          : null,
+        likes: i.like_count
+          ? `${Math.round(i.like_count / 1000)}K`
+          : null,
+        duration: i.duration || null,
+        size: i.filesize_approx
+          ? `${(i.filesize_approx / 1024 / 1024).toFixed(2)} MB`
+          : null
+      };
+
+      metaCache.set(url, meta);
+      resolve(meta);
+    });
+  });
+}
+
 /* ================= YT-DLP ================= */
 function runYtdlp(url, isMp3, progressCb) {
   return new Promise((resolve, reject) => {
@@ -87,57 +141,44 @@ function runYtdlp(url, isMp3, progressCb) {
 
     const cmd = [
       'yt-dlp',
-      COOKIES ? `--cookies-from-browser ${COOKIES}` : '',
       '--newline',
       '--no-playlist',
-      isMp3
-        ? '-x --audio-format mp3'
-        : '-f bestvideo+bestaudio/best',
+      COOKIES ? `--cookies "${COOKIES}"` : '',
+      isMp3 ? '-x --audio-format mp3' : '-f bestvideo+bestaudio/best',
       `-o "${out}"`,
       `"${url}"`
     ].join(' ');
 
+    let lastPercent = 0;
+    let lastTime = Date.now();
+
     const p = exec(cmd);
 
     p.stdout.on('data', d => {
-      const m = d.toString().match(/(\d+\.\d+)%.*?ETA\s+(\d+:\d+)/);
-      if (m) progressCb(m[1], m[2]);
+      const line = d.toString();
+      const m = line.match(/(\d+(?:\.\d+)?)%.*?([\d.]+\w+\/s).*?ETA\s+([\d:]+)/);
+
+      if (m) {
+        const percent = parseFloat(m[1]);
+        const speed = m[2];
+        const eta = m[3];
+
+        if (percent !== lastPercent || Date.now() - lastTime > 4000) {
+          lastPercent = percent;
+          lastTime = Date.now();
+          progressCb(percent, speed, eta);
+        }
+      }
     });
 
     p.on('close', code => {
       if (code !== 0) return reject();
+
       const file = fs
         .readdirSync(TMP_DIR)
         .find(f => f.startsWith(id));
+
       resolve(path.join(TMP_DIR, file));
-    });
-  });
-}
-
-/* ================= META ================= */
-function extractMeta(url) {
-  return new Promise(resolve => {
-    if (metaCache.has(url)) return resolve(metaCache.get(url));
-
-    exec(`yt-dlp -j "${url}"`, (e, out) => {
-      if (e) return resolve({});
-      const i = JSON.parse(out);
-      const meta = {
-        platform: detectPlatform(url),
-        author: i.uploader || i.channel,
-        description:
-          i.description && i.description.length < 200
-            ? i.description
-            : i.title,
-        views: i.view_count ? `${Math.round(i.view_count / 1000)}K` : null,
-        likes: i.like_count ? `${Math.round(i.like_count / 1000)}K` : null,
-        duration: i.duration ? i.duration.toFixed(2) : null,
-        size: i.filesize_approx
-          ? `${(i.filesize_approx / 1024 / 1024).toFixed(2)} MB`
-          : null
-      };
-      metaCache.set(url, meta);
-      resolve(meta);
     });
   });
 }
@@ -145,29 +186,38 @@ function extractMeta(url) {
 /* ================= QUEUE ================= */
 async function processQueue() {
   if (running >= MAX_QUEUE || queue.length === 0) return;
-  running++;
 
+  running++;
   const job = queue.shift();
+
   try {
     const meta = await extractMeta(job.url);
-    let last = 0;
+
+    let spinnerIndex = 0;
+    let lastEdit = 0;
 
     const msg = await bot.sendMessage(
       job.chat,
-      'â³ Downloading...\n0%'
+      '⏳ Downloading...\n0%'
     );
 
     const file = await runYtdlp(
       job.url,
       job.mp3,
-      async (p, eta) => {
-        if (Date.now() - last > 5000) {
-          last = Date.now();
-          await bot.editMessageText(
-            `â³ Downloading...\n${p}%\nETA ${eta}`,
-            { chat_id: job.chat, message_id: msg.message_id }
-          );
-        }
+      async (percent, speed, eta) => {
+        if (Date.now() - lastEdit < 5000) return;
+        lastEdit = Date.now();
+
+        const spinner =
+          SPINNER_FRAMES[spinnerIndex++ % SPINNER_FRAMES.length];
+
+        await bot.editMessageText(
+          `⏳ Downloading ${spinner}\n` +
+          `${progressBar(percent)} ${Math.floor(percent)}%\n` +
+          `📶 ${speed}\n` +
+          `🧠 ETA ${eta}`,
+          { chat_id: job.chat, message_id: msg.message_id }
+        );
       }
     );
 
@@ -176,8 +226,8 @@ async function processQueue() {
     });
 
     fileCache.set(job.url, file);
-  } catch {
-    bot.sendMessage(job.chat, 'âŒ Gagal download');
+  } catch (e) {
+    bot.sendMessage(job.chat, '❌ Gagal download');
   } finally {
     running--;
     cleanup();
@@ -189,50 +239,52 @@ async function processQueue() {
 bot.onText(/\/start/, m => {
   bot.sendMessage(
     m.chat.id,
-    `ðŸ‘‹ Welcome!
+    `👋 Welcome!
 
-ðŸ“¥ Kirim link TikTok / FB / IG / YT
-ðŸŽµ /mp3 <link> audio only
-ðŸ“Š /stats statistik bot`
+📥 Kirim link TikTok / FB / IG / YT
+🎵 /mp3 <link> audio only
+📊 /stats statistik bot`
   );
 });
 
 bot.onText(/\/stats/, m => {
   bot.sendMessage(
     m.chat.id,
-    `ðŸ“Š Statistik Bot
+    `📊 Statistik Bot
 Queue: ${queue.length}
 Running: ${running}
-Cache: ${fileCache.size}`
+Cache file: ${fileCache.size}`
   );
 });
 
 bot.onText(/\/mp3 (.+)/, (m, g) => {
   if (!canUse(m.from.id))
-    return bot.sendMessage(m.chat.id, 'âŒ Limit tercapai');
+    return bot.sendMessage(m.chat.id, '❌ Limit tercapai');
 
   queue.push({
     chat: m.chat.id,
     url: g[1],
     mp3: true
   });
+
   processQueue();
 });
 
 bot.on('message', m => {
   if (!m.text || m.text.startsWith('/')) return;
   if (!canUse(m.from.id))
-    return bot.sendMessage(m.chat.id, 'âŒ Limit tercapai');
+    return bot.sendMessage(m.chat.id, '❌ Limit tercapai');
 
   queue.push({
     chat: m.chat.id,
     url: m.text,
     mp3: false
   });
+
   processQueue();
 });
 
 /* ================= CLEANER ================= */
 setInterval(cleanup, 1000 * 60 * 10);
 
-console.log('âœ… Bot RUNNING');
+console.log('✅ Bot RUNNING');
