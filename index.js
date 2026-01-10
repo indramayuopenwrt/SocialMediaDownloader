@@ -1,196 +1,240 @@
-/**
- * SOCIAL MEDIA DOWNLOADER BOT
- * FINAL STABLE WEBHOOK VERSION
- * Railway-ready
- */
+/* =========================================================
+   TELEGRAM VIDEO DOWNLOADER BOT – FINAL PRODUCTION
+   Webhook • Queue • Cache • Progress Animation
+========================================================= */
 
+const TelegramBot = require('node-telegram-bot-api');
+const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { spawn } = require('child_process');
-const express = require('express');
-const TelegramBot = require('node-telegram-bot-api');
 
-/* ================== ENV ================== */
-const TOKEN = process.env.BOT_TOKEN;
-const WEBHOOK_URL = process.env.WEBHOOK_URL; // https://xxx.up.railway.app
+/* ===================== ENV ===================== */
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const PUBLIC_URL = process.env.PUBLIC_URL;
+const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').map(Number);
 const PORT = process.env.PORT || 8080;
 
-if (!TOKEN || !WEBHOOK_URL) {
-  console.error('❌ BOT_TOKEN / WEBHOOK_URL belum di-set');
+if (!BOT_TOKEN || !PUBLIC_URL) {
+  console.error('❌ BOT_TOKEN / PUBLIC_URL belum di-set');
   process.exit(1);
 }
 
-/* ================== BOT ================== */
-const bot = new TelegramBot(TOKEN);
-bot.setWebHook(`${WEBHOOK_URL}/bot${TOKEN}`);
-
-/* ================== EXPRESS ================== */
+/* ===================== BOT & SERVER ===================== */
+const bot = new TelegramBot(BOT_TOKEN);
 const app = express();
 app.use(express.json());
 
-app.post(`/bot${TOKEN}`, (req, res) => {
+/* ===================== PATH ===================== */
+const TMP = './tmp';
+const FILE_DIR = path.join(TMP, 'files');
+const META_FILE = path.join(TMP, 'meta.json');
+
+if (!fs.existsSync(TMP)) fs.mkdirSync(TMP);
+if (!fs.existsSync(FILE_DIR)) fs.mkdirSync(FILE_DIR);
+if (!fs.existsSync(META_FILE)) fs.writeFileSync(META_FILE, '{}');
+
+/* ===================== STATE ===================== */
+const queue = [];
+let running = 0;
+const MAX_RUNNING = 2;
+const USER_LIMIT = 30;
+const userUsage = new Map();
+
+/* ===================== UTIL ===================== */
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const hash = s => crypto.createHash('md5').update(s).digest('hex');
+const isAdmin = id => ADMIN_IDS.includes(id);
+
+/* ===================== SAFE SEND (ANTI 429) ===================== */
+let lastSend = 0;
+async function safeSend(fn) {
+  const now = Date.now();
+  if (now - lastSend < 1100) await sleep(1100);
+  lastSend = Date.now();
+  return fn();
+}
+
+/* ===================== CACHE ===================== */
+function loadMeta() {
+  return JSON.parse(fs.readFileSync(META_FILE));
+}
+function saveMeta(data) {
+  fs.writeFileSync(META_FILE, JSON.stringify(data, null, 2));
+}
+
+/* ===================== METADATA ===================== */
+async function fetchMeta(url) {
+  const key = hash(url);
+  const cache = loadMeta();
+  if (cache[key]) return cache[key];
+
+  return new Promise(resolve => {
+    const p = spawn('yt-dlp', ['-J', '--no-playlist', url]);
+    let out = '';
+
+    p.stdout.on('data', d => out += d.toString());
+    p.on('close', () => {
+      try {
+        const j = JSON.parse(out);
+        const meta = {
+          title: j.title || 'Video',
+          author: j.uploader || j.channel || '-',
+          views: j.view_count || 0,
+          duration: j.duration || '-'
+        };
+        cache[key] = meta;
+        saveMeta(cache);
+        resolve(meta);
+      } catch {
+        resolve({});
+      }
+    });
+  });
+}
+
+/* ===================== CAPTION ===================== */
+function buildCaption(m) {
+  return (
+`🎬 ${m.title}
+👤 ${m.author}
+👁️ ${m.views.toLocaleString()} views
+⏱️ ${m.duration} detik`
+  );
+}
+
+/* ===================== PROGRESS BAR ===================== */
+function progressBar(percent, frame) {
+  const total = 10;
+  const filled = Math.round((percent / 100) * total);
+  const anim = ['⏳','⌛','⏰'][frame % 3];
+  return `${anim} ${percent.toFixed(1)}%\n${'█'.repeat(filled)}${'░'.repeat(total - filled)}`;
+}
+
+/* ===================== DOWNLOAD ===================== */
+function cachedFile(url, mp3) {
+  const ext = mp3 ? 'mp3' : 'mp4';
+  const f = path.join(FILE_DIR, `${hash(url)}.${ext}`);
+  return fs.existsSync(f) ? f : null;
+}
+
+async function download(url, mp3, onProgress) {
+  const output = path.join(FILE_DIR, `${hash(url)}.%(ext)s`);
+  const args = ['--newline', '--no-playlist', '-o', output, url];
+  if (mp3) args.unshift('-x', '--audio-format', 'mp3');
+
+  return new Promise((resolve, reject) => {
+    const p = spawn('yt-dlp', args);
+    let frame = 0;
+
+    p.stdout.on('data', d => {
+      const m = d.toString().match(/(\d+\.\d+)%/);
+      if (m) onProgress(parseFloat(m[1]), frame++);
+    });
+
+    p.on('close', c => {
+      if (c !== 0) return reject();
+      const file = fs.readdirSync(FILE_DIR).find(v => v.startsWith(hash(url)));
+      resolve(path.join(FILE_DIR, file));
+    });
+  });
+}
+
+/* ===================== QUEUE ===================== */
+async function processQueue() {
+  if (running >= MAX_RUNNING || queue.length === 0) return;
+  running++;
+
+  const job = queue.shift();
+  try {
+    const meta = await fetchMeta(job.url);
+
+    const msg = await safeSend(() =>
+      bot.sendMessage(job.chat, '⏳ Downloading...\n0%')
+    );
+
+    let lastEdit = 0;
+    const file =
+      cachedFile(job.url, job.mp3) ||
+      await download(job.url, job.mp3, async (p, f) => {
+        if (Date.now() - lastEdit > 5000 && p < 100) {
+          lastEdit = Date.now();
+          await safeSend(() =>
+            bot.editMessageText(progressBar(p, f), {
+              chat_id: job.chat,
+              message_id: msg.message_id
+            })
+          );
+        }
+      });
+
+    await safeSend(() =>
+      bot.sendDocument(job.chat, file, { caption: buildCaption(meta) })
+    );
+
+    await safeSend(() =>
+      bot.deleteMessage(job.chat, msg.message_id)
+    );
+
+  } catch {
+    await safeSend(() =>
+      bot.sendMessage(job.chat, '❌ Gagal memproses video')
+    );
+  } finally {
+    running--;
+    processQueue();
+  }
+}
+
+/* ===================== LIMIT ===================== */
+function canUse(id) {
+  if (isAdmin(id)) return true;
+  const used = userUsage.get(id) || 0;
+  if (used >= USER_LIMIT) return false;
+  userUsage.set(id, used + 1);
+  return true;
+}
+
+/* ===================== COMMAND ===================== */
+bot.onText(/\/start/, m => {
+  bot.sendMessage(m.chat.id,
+`👋 Welcome Downloader Bot
+📥 Kirim link TikTok / IG / FB / YT
+🎵 /mp3 <link>
+📊 /stats`);
+});
+
+bot.onText(/\/stats/, m => {
+  bot.sendMessage(m.chat.id,
+`📊 STATUS BOT
+Queue : ${queue.length}
+Running : ${running}
+Cache : ${fs.readdirSync(FILE_DIR).length}`);
+});
+
+bot.onText(/\/mp3 (.+)/, (m, g) => {
+  if (!canUse(m.from.id))
+    return bot.sendMessage(m.chat.id, '❌ Limit tercapai');
+  queue.push({ chat: m.chat.id, url: g[1], mp3: true });
+  processQueue();
+});
+
+bot.on('message', m => {
+  if (!m.text || m.text.startsWith('/')) return;
+  if (!canUse(m.from.id))
+    return bot.sendMessage(m.chat.id, '❌ Limit tercapai');
+  queue.push({ chat: m.chat.id, url: m.text, mp3: false });
+  processQueue();
+});
+
+/* ===================== WEBHOOK ===================== */
+app.post(`/bot${BOT_TOKEN}`, (req, res) => {
   bot.processUpdate(req.body);
   res.sendStatus(200);
 });
 
-app.listen(PORT, () => {
-  console.log('✅ BOT WEBHOOK FINAL RUNNING');
-  console.log('🌐 Webhook aktif di', PORT);
+app.listen(PORT, async () => {
+  await bot.setWebHook(`${PUBLIC_URL}/bot${BOT_TOKEN}`);
+  console.log('✅ BOT WEBHOOK RUNNING');
 });
-
-/* ================== GLOBAL ================== */
-const TMP_DIR = path.join(__dirname, 'tmp');
-if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR);
-
-const ADMIN_IDS = (process.env.ADMIN_IDS || '')
-  .split(',')
-  .map(x => x.trim())
-  .filter(Boolean);
-
-const userQueue = new Map();
-
-/* ================== SAFE GUARD ================== */
-process.on('unhandledRejection', err => {
-  console.error('Unhandled rejection ignored:', err?.message);
-});
-
-/* ================== UTIL ================== */
-function isAdmin(id) {
-  return ADMIN_IDS.includes(String(id));
-}
-
-function bar(percent) {
-  const total = 10;
-  const filled = Math.round((percent / 100) * total);
-  return '█'.repeat(filled) + '░'.repeat(total - filled);
-}
-
-/* ====== TELEGRAM SAFE EDIT (ANTI 429) ====== */
-let lastEditTime = 0;
-let lastPercentSent = -1;
-
-async function safeEdit(chatId, messageId, text) {
-  const now = Date.now();
-  if (now - lastEditTime < 1100) return;
-  lastEditTime = now;
-
-  try {
-    await bot.editMessageText(text, {
-      chat_id: chatId,
-      message_id: messageId
-    });
-  } catch (e) {
-    if (e.response?.body?.error_code === 429) return;
-  }
-}
-
-/* ================== START ================== */
-bot.onText(/\/start/, msg => {
-  bot.sendMessage(
-    msg.chat.id,
-    `👋 Welcome SocialMediaDownloader\n\n` +
-    `📥 Kirim link TikTok / FB / IG / YT\n` +
-    `🎧 /mp3 <link> → audio only`
-  );
-});
-
-/* ================== MP3 ================== */
-bot.onText(/\/mp3 (.+)/, (msg, match) => {
-  handleDownload(msg, match[1], true);
-});
-
-/* ================== LINK HANDLER ================== */
-bot.on('message', msg => {
-  if (!msg.text) return;
-  if (msg.text.startsWith('/')) return;
-
-  const url = msg.text.trim();
-  if (!/^https?:\/\//i.test(url)) return;
-
-  handleDownload(msg, url, false);
-});
-
-/* ================== CORE ================== */
-async function handleDownload(msg, url, audioOnly) {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-
-  if (userQueue.get(userId)) {
-    return bot.sendMessage(chatId, '⏳ Masih ada proses berjalan...');
-  }
-
-  userQueue.set(userId, true);
-
-  let progressMsg;
-  try {
-    progressMsg = await bot.sendMessage(chatId, '⏳ Downloading...\n0%\n░░░░░░░░░░');
-  } catch {
-    userQueue.delete(userId);
-    return;
-  }
-
-  const outFile = path.join(
-    TMP_DIR,
-    `${Date.now()}_${userId}.${audioOnly ? 'mp3' : 'mp4'}`
-  );
-
-  const args = [
-    '-f', audioOnly ? 'bestaudio' : 'best',
-    '--newline',
-    '-o', outFile,
-    url
-  ];
-
-  if (audioOnly) {
-    args.push('-x', '--audio-format', 'mp3');
-  }
-
-  const ytdlp = spawn('yt-dlp', args);
-
-  ytdlp.stdout.on('data', data => {
-    const line = data.toString();
-    const m = line.match(/(\d+(?:\.\d+)?)%/);
-    if (!m) return;
-
-    const percent = Math.floor(parseFloat(m[1]));
-    if (percent === lastPercentSent) return;
-    lastPercentSent = percent;
-
-    if (percent >= 100) return;
-
-    safeEdit(
-      chatId,
-      progressMsg.message_id,
-      `⏳ Downloading...\n${percent}%\n${bar(percent)}`
-    );
-  });
-
-  ytdlp.on('close', async code => {
-    lastPercentSent = -1;
-
-    if (code !== 0 || !fs.existsSync(outFile)) {
-      await bot.sendMessage(chatId, '❌ Gagal download');
-      cleanup(outFile);
-      userQueue.delete(userId);
-      return;
-    }
-
-    try {
-      await bot.deleteMessage(chatId, progressMsg.message_id);
-    } catch {}
-
-    if (audioOnly) {
-      await bot.sendAudio(chatId, outFile);
-    } else {
-      await bot.sendVideo(chatId, outFile);
-    }
-
-    cleanup(outFile);
-    userQueue.delete(userId);
-  });
-}
-
-/* ================== CLEANUP ================== */
-function cleanup(file) {
-  fs.existsSync(file) && fs.unlinkSync(file);
-   }
