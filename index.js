@@ -7,55 +7,67 @@ const crypto = require('crypto');
 
 /* ================= ENV ================= */
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').map(Number);
-const WEBHOOK_URL = process.env.WEBHOOK_URL; // https://xxxx.up.railway.app
+const ADMIN_IDS = (process.env.ADMIN_IDS || '')
+  .split(',')
+  .map(v => Number(v.trim()))
+  .filter(Boolean);
+const BASE_URL = process.env.BASE_URL; // https://xxxxx.up.railway.app
+const COOKIES = process.env.COOKIES || '';
 const PORT = process.env.PORT || 3000;
+
+if (!BOT_TOKEN || !BASE_URL) {
+  console.error('❌ BOT_TOKEN / BASE_URL belum diset');
+  process.exit(1);
+}
 
 /* ================= BOT ================= */
 const bot = new TelegramBot(BOT_TOKEN);
 const app = express();
 app.use(express.json());
 
-bot.setWebHook(`${WEBHOOK_URL}/bot${BOT_TOKEN}`);
+const WEBHOOK_PATH = `/webhook/${BOT_TOKEN}`;
+bot.setWebHook(`${BASE_URL}${WEBHOOK_PATH}`);
 
-app.post(`/bot${BOT_TOKEN}`, (req, res) => {
+app.post(WEBHOOK_PATH, (req, res) => {
   bot.processUpdate(req.body);
   res.sendStatus(200);
 });
 
-app.get('/', (_, res) => res.send('✅ Bot alive'));
-
-app.listen(PORT, () => console.log('🚀 Webhook running on port', PORT));
+app.get('/', (_, res) => res.send('🤖 Bot Running'));
+app.listen(PORT, () => console.log(`🌐 Webhook aktif di ${PORT}`));
 
 /* ================= CONFIG ================= */
 const TMP_DIR = './tmp';
 const MAX_QUEUE = 3;
 const USER_LIMIT = 5;
-const CACHE_TTL = 1000 * 60 * 60;
-
-if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR);
+const CACHE_TTL = 1000 * 60 * 60 * 6;
 
 /* ================= STATE ================= */
+if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR);
+
 const queue = [];
 let running = 0;
+
 const userUsage = new Map();
 const metaCache = new Map();
+const fileCache = new Map();
 
 /* ================= UTILS ================= */
 const hash = s => crypto.createHash('md5').update(s).digest('hex');
 
-function isAdmin(id) {
-  return ADMIN_IDS.includes(id);
-}
+const isAdmin = id => ADMIN_IDS.includes(id);
 
 function canUse(id) {
   if (isAdmin(id)) return true;
-  const used = userUsage.get(id) || 0;
-  if (used >= USER_LIMIT) return false;
-  userUsage.set(id, used + 1);
-  return true;
+  return (userUsage.get(id) || 0) < USER_LIMIT;
 }
 
+function incUsage(id) {
+  if (isAdmin(id)) return;
+  userUsage.set(id, (userUsage.get(id) || 0) + 1);
+}
+
+/* ================= CLEANUP ================= */
 function cleanup() {
   for (const f of fs.readdirSync(TMP_DIR)) {
     const p = path.join(TMP_DIR, f);
@@ -64,116 +76,144 @@ function cleanup() {
     }
   }
 }
+setInterval(cleanup, 1000 * 60 * 10);
 
-/* ================= CAPTION ================= */
-function buildCaption(meta) {
-  return [
-    `🎬 ${meta.platform}`,
-    meta.author ? `👤 ${meta.author}` : null,
-    meta.description ? `📝 ${meta.description}` : null,
-    meta.views || meta.likes
-      ? `👁️ ${meta.views || '-'}   👍 ${meta.likes || '-'}`
-      : null,
-    `⏱️ ${meta.duration || '-'} detik`,
-    meta.size ? `📦 ${meta.size}` : null,
-    meta.url ? `🔗 ${meta.url}` : null
-  ]
-    .filter(Boolean)
-    .join('\n');
-}
-
-function detectPlatform(url) {
+/* ================= META ================= */
+function platform(url) {
   if (/tiktok/i.test(url)) return 'TikTok';
   if (/facebook|fb/i.test(url)) return 'Facebook';
-  if (/instagram/i.test(url)) return 'Instagram';
+  if (/instagram|ig/i.test(url)) return 'Instagram';
   if (/youtu/i.test(url)) return 'YouTube';
   return 'Video';
 }
 
-/* ================= META ================= */
 function extractMeta(url) {
   if (metaCache.has(url)) return Promise.resolve(metaCache.get(url));
 
-  return new Promise(resolve => {
+  return new Promise(r => {
     exec(`yt-dlp -j "${url}"`, (e, out) => {
-      if (e) return resolve({ platform: detectPlatform(url), url });
+      if (e) return r({ platform: platform(url) });
       const i = JSON.parse(out);
-      const meta = {
-        platform: detectPlatform(url),
+      const m = {
+        platform: platform(url),
         author: i.uploader || i.channel,
-        description: i.description || i.title,
+        description:
+          i.description && i.description.length < 300
+            ? i.description
+            : i.title,
         views: i.view_count ? `${Math.round(i.view_count / 1000)}K` : null,
         likes: i.like_count ? `${Math.round(i.like_count / 1000)}K` : null,
-        duration: i.duration ? i.duration.toFixed(2) : null,
+        duration: i.duration || null,
         size: i.filesize_approx
           ? `${(i.filesize_approx / 1024 / 1024).toFixed(2)} MB`
-          : null,
-        url
+          : null
       };
-      metaCache.set(url, meta);
-      resolve(meta);
+      metaCache.set(url, m);
+      r(m);
     });
   });
 }
 
-/* ================= YT-DLP ================= */
-function runYtdlp(url, isMp3, onProgress) {
-  return new Promise((resolve, reject) => {
-    const id = hash(url);
-    const out = `${TMP_DIR}/${id}.%(ext)s`;
+/* ================= CAPTION ================= */
+function caption(m) {
+  return [
+    `🎬 ${m.platform}`,
+    '',
+    m.author ? `👤 ${m.author}` : '',
+    m.description ? `📝 ${m.description}` : '',
+    '',
+    m.views ? `👁️ ${m.views}` : '',
+    m.likes ? `👍 ${m.likes}` : '',
+    m.duration ? `⏱️ ${m.duration} detik` : '',
+    m.size ? `📦 ${m.size}` : ''
+  ].filter(Boolean).join('\n');
+}
 
+/* ================= PROGRESS ================= */
+const bar = p =>
+  '█'.repeat(Math.round(p / 10)) +
+  '░'.repeat(10 - Math.round(p / 10));
+
+/* ================= YT-DLP ================= */
+function runYtdlp(url, mp3, onProg) {
+  return new Promise((res, rej) => {
+    const id = hash(url);
+    if (fileCache.has(id)) return res(fileCache.get(id));
+
+    const out = `${TMP_DIR}/${id}.%(ext)s`;
     const cmd = [
       'yt-dlp',
+      COOKIES ? `--cookies "${COOKIES}"` : '',
       '--newline',
       '--no-playlist',
-      isMp3 ? '-x --audio-format mp3' : '-f bestvideo+bestaudio/best',
+      mp3 ? '-x --audio-format mp3' : '-f bestvideo+bestaudio/best',
       `-o "${out}"`,
       `"${url}"`
     ].join(' ');
 
-    const p = exec(cmd);
-    let lastUpdate = 0;
+    let emaEta = null;
+    const alpha = 0.2;
 
+    const p = exec(cmd);
     p.stdout.on('data', d => {
-      const line = d.toString();
-      const m = line.match(/(\d+\.\d+)%.*?(\d+(\.\d+)?)(KiB|MiB)\/s.*?ETA\s+(\d+:\d+)/);
-      if (m && Date.now() - lastUpdate > 3000) {
-        lastUpdate = Date.now();
-        onProgress(`${m[1]}%`, `${m[2]} ${m[4]}/s`, m[5]);
+      const s = d.toString();
+      const m = s.match(/(\d+\.\d+)%.*?ETA\s+([\d:]+)/);
+      const sp = s.match(/(\d+\.\d+)(MiB|KiB)\/s/);
+
+      if (m) {
+        const eta = m[2];
+        emaEta = emaEta
+          ? alpha * eta + (1 - alpha) * emaEta
+          : eta;
+
+        onProg({
+          percent: +m[1],
+          eta: emaEta,
+          speed: sp ? `${sp[1]} ${sp[2]}/s` : '-'
+        });
       }
     });
 
-    p.on('close', code => {
-      if (code !== 0) return reject();
-      const file = fs.readdirSync(TMP_DIR).find(f => f.startsWith(id));
-      resolve(path.join(TMP_DIR, file));
+    p.on('close', c => {
+      if (c !== 0) return rej();
+      const f = fs.readdirSync(TMP_DIR).find(v => v.startsWith(id));
+      const fp = path.join(TMP_DIR, f);
+      fileCache.set(id, fp);
+      res(fp);
     });
   });
 }
 
 /* ================= QUEUE ================= */
 async function processQueue() {
-  if (running >= MAX_QUEUE || queue.length === 0) return;
+  if (running >= MAX_QUEUE || !queue.length) return;
   running++;
 
-  const job = queue.shift();
+  const j = queue.shift();
   try {
-    const meta = await extractMeta(job.url);
+    const meta = await extractMeta(j.url);
+    let last = 0;
 
-    const msg = await bot.sendMessage(job.chat, '⏳ Downloading...\n0%');
+    const msg = await bot.sendMessage(
+      j.chat,
+      `⏳ Downloading...\n0%\n${bar(0)}`
+    );
 
-    const file = await runYtdlp(job.url, job.mp3, async (p, speed, eta) => {
+    const file = await runYtdlp(j.url, j.mp3, async p => {
+      if (Date.now() - last < 4000) return;
+      last = Date.now();
       await bot.editMessageText(
-        `⏳ Downloading...\n${p}\n⚡ ${speed}\n⏱️ ETA ${eta}`,
-        { chat_id: job.chat, message_id: msg.message_id }
+        `⏳ Downloading...\n${p.percent.toFixed(1)}%\n${bar(
+          p.percent
+        )}\n📶 ${p.speed}\nETA ${p.eta}`,
+        { chat_id: j.chat, message_id: msg.message_id }
       );
     });
 
-    await bot.sendDocument(job.chat, file, {
-      caption: buildCaption(meta)
-    });
+    await bot.sendDocument(j.chat, file, { caption: caption(meta) });
+    incUsage(j.user);
   } catch {
-    bot.sendMessage(job.chat, '❌ Gagal download');
+    bot.sendMessage(j.chat, '❌ Gagal download');
   } finally {
     running--;
     cleanup();
@@ -182,31 +222,30 @@ async function processQueue() {
 }
 
 /* ================= COMMANDS ================= */
-bot.onText(/\/start/, m => {
+bot.onText(/\/start/, m =>
   bot.sendMessage(
     m.chat.id,
     `👋 Welcome SocialMediaDownloader
-
 📥 Kirim link TikTok / FB / IG / YT
-🎵 /mp3 <link> → audio only
-📊 /stats → statistik bot`
-  );
-});
+🎵 /mp3 <link>
+📊 /stats`
+  )
+);
 
-bot.onText(/\/stats/, m => {
+bot.onText(/\/stats/, m =>
   bot.sendMessage(
     m.chat.id,
-    `📊 Statistik Bot
-Queue: ${queue.length}
-Running: ${running}
-Cache: ${metaCache.size}`
-  );
-});
+    `📊 Queue ${queue.length}
+⚙️ Running ${running}
+📦 Cache ${fileCache.size}`
+  )
+);
 
 bot.onText(/\/mp3 (.+)/, (m, g) => {
   if (!canUse(m.from.id))
     return bot.sendMessage(m.chat.id, '❌ Limit tercapai');
-  queue.push({ chat: m.chat.id, url: g[1], mp3: true });
+
+  queue.push({ chat: m.chat.id, user: m.from.id, url: g[1], mp3: true });
   processQueue();
 });
 
@@ -214,10 +253,9 @@ bot.on('message', m => {
   if (!m.text || m.text.startsWith('/')) return;
   if (!canUse(m.from.id))
     return bot.sendMessage(m.chat.id, '❌ Limit tercapai');
-  queue.push({ chat: m.chat.id, url: m.text, mp3: false });
+
+  queue.push({ chat: m.chat.id, user: m.from.id, url: m.text, mp3: false });
   processQueue();
 });
 
-/* ================= CLEANER ================= */
-setInterval(cleanup, 1000 * 60 * 10);
-console.log('✅ Bot READY (Webhook mode)');
+console.log('✅ BOT WEBHOOK FINAL RUNNING');
