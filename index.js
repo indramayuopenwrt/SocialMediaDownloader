@@ -1,219 +1,132 @@
-/**
- * TELEGRAM AUTO DOWNLOADER BOT
- * FINAL STABLE VERSION
- * Node 20 + Railway SAFE
- */
-
 const TelegramBot = require("node-telegram-bot-api");
-const { execFile } = require("child_process");
+const { spawn } = require("child_process");
 const fs = require("fs");
-const path = require("path");
-const { LRUCache } = require("lru-cache");
 const PQueue = require("p-queue").default;
 
-/* ================= ENV ================= */
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const ADMIN_IDS = (process.env.ADMIN_IDS || "")
-  .split(",")
-  .map((x) => Number(x.trim()))
-  .filter(Boolean);
+const TOKEN = process.env.BOT_TOKEN;
+const ADMIN_ID = process.env.ADMIN_ID; // optional
 
-if (!BOT_TOKEN) {
-  console.error("❌ BOT_TOKEN belum di set");
+if (!TOKEN) {
+  console.error("BOT_TOKEN kosong");
   process.exit(1);
 }
 
-/* ================= CONST ================= */
-const DOWNLOAD_DIR = "/tmp";
-const COOKIE_FILE = "cookies.txt";
+const bot = new TelegramBot(TOKEN, { polling: true });
 
-/* ================= BOT ================= */
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-
-/* ================= CACHE ================= */
-const cache = new LRUCache({
-  max: 500,
-  ttl: 1000 * 60 * 30, // 30 menit
-});
-
-/* ================= QUEUE ================= */
+// ===== QUEUE (ANTI CRASH) =====
 const queue = new PQueue({
   concurrency: 1,
+  intervalCap: 2,
+  interval: 5000
 });
 
-/* ================= STATS ================= */
+// ===== STATS =====
 const stats = {
   total: 0,
   success: 0,
   failed: 0,
+  startTime: Date.now()
 };
 
-/* ================= UTIL ================= */
-const isAdmin = (id) => ADMIN_IDS.includes(id);
-
+// ===== UTIL =====
 function detectPlatform(url) {
-  if (/tiktok\.com/i.test(url)) return "tiktok";
-  if (/youtu\.be|youtube\.com/i.test(url)) return "youtube";
-  if (/facebook\.com|fb\.watch/i.test(url)) return "facebook";
-  if (/instagram\.com/i.test(url)) return "instagram";
-  return "unknown";
+  if (/tiktok\.com/.test(url)) return "TikTok";
+  if (/youtu\.be|youtube\.com/.test(url)) return "YouTube";
+  if (/facebook\.com|fb\.watch/.test(url)) return "Facebook";
+  return "Unknown";
 }
 
-/* ================= FB PRIVATE CHECK ================= */
-function checkFBPrivate(url) {
-  return new Promise((resolve) => {
-    execFile(
-      "yt-dlp",
-      ["--cookies", COOKIE_FILE, "--dump-json", "--no-playlist", url],
-      (err, stdout, stderr) => {
-        if (!err) return resolve(false);
-
-        const msg = (stderr || "").toLowerCase();
-        if (
-          msg.includes("login") ||
-          msg.includes("private") ||
-          msg.includes("checkpoint") ||
-          msg.includes("not available")
-        ) {
-          return resolve(true);
-        }
-        resolve(false);
-      }
-    );
-  });
-}
-
-/* ================= FORMAT AUTO ================= */
-function getFormat(platform) {
-  if (platform === "youtube") {
-    return [
-      "bv*[height<=1080]+ba/b",
-      "bv*[height<=720]+ba/b",
-      "b",
-    ];
-  }
-  return ["b"];
-}
-
-/* ================= DOWNLOAD ================= */
-function downloadVideo(url, platform) {
-  const output = path.join(DOWNLOAD_DIR, `${Date.now()}.mp4`);
-  const formats = getFormat(platform);
-
-  return new Promise((resolve, reject) => {
-    const tryFormat = (i) => {
-      if (i >= formats.length) return reject("FORMAT_FAILED");
-
-      const args = [
-        "-f",
-        formats[i],
-        "--merge-output-format",
-        "mp4",
-        "--no-playlist",
-        "--retries",
-        "3",
-        "--fragment-retries",
-        "3",
-        "--concurrent-fragments",
-        "1",
-        "-o",
-        output,
-        url,
-      ];
-
-      if (platform === "facebook" && fs.existsSync(COOKIE_FILE)) {
-        args.unshift("--cookies", COOKIE_FILE);
-      }
-
-      execFile("yt-dlp", args, { timeout: 1000 * 60 * 5 }, (err) => {
-        if (!err) return resolve(output);
-        tryFormat(i + 1);
-      });
-    };
-
-    tryFormat(0);
-  });
-}
-
-/* ================= COMMANDS ================= */
-bot.onText(/\/start/, (msg) => {
+// ===== COMMANDS =====
+bot.onText(/\/start/, msg => {
   bot.sendMessage(
     msg.chat.id,
-    "👋 *Downloader Bot*\n\n" +
-      "📥 Kirim link:\n" +
-      "YouTube / TikTok / Instagram / Facebook\n\n" +
-      "⚡ Auto detect resolusi\n" +
-      "🧠 Queue anti crash",
-    { parse_mode: "Markdown" }
+    "👋 Kirim link YouTube / TikTok / Facebook\n\n⚡ Auto detect • Queue aman • Anti hang"
   );
 });
 
-bot.onText(/\/stats/, (msg) => {
-  if (!isAdmin(msg.from.id)) return;
+bot.onText(/\/stats/, msg => {
+  const uptime = Math.floor((Date.now() - stats.startTime) / 1000);
   bot.sendMessage(
     msg.chat.id,
-    `📊 *BOT STATS*\n\n` +
-      `📥 Total: ${stats.total}\n` +
-      `✅ Success: ${stats.success}\n` +
-      `❌ Failed: ${stats.failed}\n` +
-      `🧠 Queue: ${queue.size}`,
-    { parse_mode: "Markdown" }
+    `📊 BOT STATS
+━━━━━━━━━━━━━━
+📥 Total: ${stats.total}
+✅ Success: ${stats.success}
+❌ Failed: ${stats.failed}
+⏱ Uptime: ${uptime}s
+📦 Queue: ${queue.size}`
   );
 });
 
-/* ================= MESSAGE ================= */
-bot.on("message", async (msg) => {
+// ===== MAIN HANDLER =====
+bot.on("message", msg => {
+  if (!msg.text) return;
+  if (msg.text.startsWith("/")) return;
+
+  const url = msg.text.trim();
+  if (!/^https?:\/\//.test(url)) return;
+
+  queue.add(() => handleDownload(msg, url));
+});
+
+// ===== DOWNLOAD LOGIC =====
+async function handleDownload(msg, url) {
   const chatId = msg.chat.id;
-  const text = msg.text || "";
+  const platform = detectPlatform(url);
 
-  if (!/^https?:\/\//i.test(text)) return;
-
-  const platform = detectPlatform(text);
-  if (platform === "unknown") {
-    bot.sendMessage(chatId, "❌ Platform tidak didukung");
-    return;
-  }
-
-  if (!isAdmin(msg.from.id) && cache.has(text)) {
-    bot.sendMessage(chatId, "⏳ Link ini sedang / sudah diproses");
-    return;
-  }
-
-  cache.set(text, true);
   stats.total++;
 
-  bot.sendMessage(
-    chatId,
-    `⏳ Processing *${platform}*\n📦 Queue: ${queue.size + 1}`,
-    { parse_mode: "Markdown" }
-  );
+  await bot.sendMessage(chatId, `⏳ Processing ${platform}...\n📦 Queue: ${queue.size}`);
 
-  queue.add(async () => {
+  const outFile = `video_${Date.now()}.mp4`;
+
+  const args = [
+    "-f",
+    "bv*[height<=720]+ba/b[height<=720]",
+    "--merge-output-format",
+    "mp4",
+    "--max-filesize",
+    "90M",
+    "-o",
+    outFile,
+    url
+  ];
+
+  // ===== SPAWN (ANTI HANG) =====
+  const proc = spawn("yt-dlp", args);
+
+  let killed = false;
+
+  const timeout = setTimeout(() => {
+    killed = true;
+    proc.kill("SIGKILL");
+  }, 60000); // 60s MAX
+
+  proc.on("close", async code => {
+    clearTimeout(timeout);
+
+    if (killed || code !== 0 || !fs.existsSync(outFile)) {
+      stats.failed++;
+      await bot.sendMessage(chatId, "❌ Download gagal / timeout");
+      cleanup(outFile);
+      return;
+    }
+
     try {
-      if (platform === "facebook" && fs.existsSync(COOKIE_FILE)) {
-        const isPrivate = await checkFBPrivate(text);
-        if (isPrivate) {
-          bot.sendMessage(
-            chatId,
-            "🔒 Video Facebook *PRIVATE / LOGIN REQUIRED*\n\n" +
-              "❌ Tidak bisa diproses.\n" +
-              "✅ Pastikan akun FB valid & cookie aktif",
-            { parse_mode: "Markdown" }
-          );
-          stats.failed++;
-          return;
-        }
-      }
-
-      const file = await downloadVideo(text, platform);
-      await bot.sendVideo(chatId, fs.createReadStream(file));
-      fs.unlinkSync(file);
+      await bot.sendVideo(chatId, outFile, { caption: "✅ Download selesai" });
       stats.success++;
     } catch (e) {
       stats.failed++;
-      bot.sendMessage(chatId, "❌ Download gagal (dibatasi sumber)");
+      await bot.sendMessage(chatId, "❌ Gagal kirim ke Telegram (size limit)");
     }
-  });
-});
 
-console.log("✅ Bot running & stable");
+    cleanup(outFile);
+  });
+}
+
+// ===== CLEANUP =====
+function cleanup(file) {
+  if (fs.existsSync(file)) fs.unlinkSync(file);
+}
+
+console.log("✅ Bot running...");
