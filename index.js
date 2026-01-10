@@ -1,261 +1,243 @@
-const TelegramBot = require('node-telegram-bot-api');
-const express = require('express');
-const { exec } = require('child_process');
+/**
+ * SocialMediaDownloader Bot
+ * FINAL – Webhook Mode (Railway)
+ * CommonJS – single file
+ */
+
 const fs = require('fs');
 const path = require('path');
+const express = require('express');
+const TelegramBot = require('node-telegram-bot-api');
+const { spawn } = require('child_process');
 const crypto = require('crypto');
 
-/* ================= ENV ================= */
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const ADMIN_IDS = (process.env.ADMIN_IDS || '')
-  .split(',')
-  .map(v => Number(v.trim()))
-  .filter(Boolean);
-const BASE_URL = process.env.BASE_URL; // https://xxxxx.up.railway.app
-const COOKIES = process.env.COOKIES || '';
+/* =======================
+   ENV
+======================= */
+const TOKEN = process.env.BOT_TOKEN;
+const WEBHOOK_URL = process.env.WEBHOOK_URL; // https://xxx.up.railway.app
 const PORT = process.env.PORT || 3000;
+const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').filter(Boolean);
 
-if (!BOT_TOKEN || !BASE_URL) {
-  console.error('❌ BOT_TOKEN / BASE_URL belum diset');
-  process.exit(1);
+/* =======================
+   PATHS
+======================= */
+const BASE_DIR = __dirname;
+const TMP_DIR = path.join(BASE_DIR, 'tmp');
+const CACHE_DIR = path.join(BASE_DIR, 'cache');
+
+for (const d of [TMP_DIR, CACHE_DIR]) {
+  if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
 }
 
-/* ================= BOT ================= */
-const bot = new TelegramBot(BOT_TOKEN);
+/* =======================
+   BOT INIT (WEBHOOK)
+======================= */
+const bot = new TelegramBot(TOKEN, { webHook: true });
 const app = express();
 app.use(express.json());
 
-const WEBHOOK_PATH = `/webhook/${BOT_TOKEN}`;
-bot.setWebHook(`${BASE_URL}${WEBHOOK_PATH}`);
+bot.setWebHook(`${WEBHOOK_URL}/bot${TOKEN}`);
 
-app.post(WEBHOOK_PATH, (req, res) => {
+app.post(`/bot${TOKEN}`, (req, res) => {
   bot.processUpdate(req.body);
   res.sendStatus(200);
 });
 
-app.get('/', (_, res) => res.send('🤖 Bot Running'));
-app.listen(PORT, () => console.log(`🌐 Webhook aktif di ${PORT}`));
+app.get('/', (_, res) => res.send('Bot is running'));
+app.listen(PORT, () => console.log('Webhook server running on', PORT));
 
-/* ================= CONFIG ================= */
-const TMP_DIR = './tmp';
-const MAX_QUEUE = 3;
-const USER_LIMIT = 5;
-const CACHE_TTL = 1000 * 60 * 60 * 6;
-
-/* ================= STATE ================= */
-if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR);
-
-const queue = [];
-let running = 0;
-
-const userUsage = new Map();
-const metaCache = new Map();
-const fileCache = new Map();
-
-/* ================= UTILS ================= */
-const hash = s => crypto.createHash('md5').update(s).digest('hex');
-
-const isAdmin = id => ADMIN_IDS.includes(id);
-
-function canUse(id) {
-  if (isAdmin(id)) return true;
-  return (userUsage.get(id) || 0) < USER_LIMIT;
+/* =======================
+   SIMPLE CACHE
+======================= */
+function hash(text) {
+  return crypto.createHash('md5').update(text).digest('hex');
 }
 
-function incUsage(id) {
-  if (isAdmin(id)) return;
-  userUsage.set(id, (userUsage.get(id) || 0) + 1);
-}
-
-/* ================= CLEANUP ================= */
-function cleanup() {
-  for (const f of fs.readdirSync(TMP_DIR)) {
-    const p = path.join(TMP_DIR, f);
-    if (Date.now() - fs.statSync(p).mtimeMs > CACHE_TTL) {
-      fs.unlinkSync(p);
-    }
+function getCache(key) {
+  const file = path.join(CACHE_DIR, `${key}.json`);
+  if (!fs.existsSync(file)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return null;
   }
 }
-setInterval(cleanup, 1000 * 60 * 10);
 
-/* ================= META ================= */
-function platform(url) {
-  if (/tiktok/i.test(url)) return 'TikTok';
-  if (/facebook|fb/i.test(url)) return 'Facebook';
-  if (/instagram|ig/i.test(url)) return 'Instagram';
-  if (/youtu/i.test(url)) return 'YouTube';
-  return 'Video';
+function setCache(key, data) {
+  const file = path.join(CACHE_DIR, `${key}.json`);
+  fs.writeFileSync(file, JSON.stringify(data));
 }
 
-function extractMeta(url) {
-  if (metaCache.has(url)) return Promise.resolve(metaCache.get(url));
+/* =======================
+   LIMIT (SIMPLE)
+======================= */
+const userHits = new Map();
+const LIMIT_PER_HOUR = 10;
 
-  return new Promise(r => {
-    exec(`yt-dlp -j "${url}"`, (e, out) => {
-      if (e) return r({ platform: platform(url) });
-      const i = JSON.parse(out);
-      const m = {
-        platform: platform(url),
-        author: i.uploader || i.channel,
-        description:
-          i.description && i.description.length < 300
-            ? i.description
-            : i.title,
-        views: i.view_count ? `${Math.round(i.view_count / 1000)}K` : null,
-        likes: i.like_count ? `${Math.round(i.like_count / 1000)}K` : null,
-        duration: i.duration || null,
-        size: i.filesize_approx
-          ? `${(i.filesize_approx / 1024 / 1024).toFixed(2)} MB`
-          : null
-      };
-      metaCache.set(url, m);
-      r(m);
-    });
-  });
+function isLimited(userId) {
+  if (ADMIN_IDS.includes(String(userId))) return false;
+
+  const now = Date.now();
+  const hour = 60 * 60 * 1000;
+
+  const data = userHits.get(userId) || [];
+  const filtered = data.filter(t => now - t < hour);
+  filtered.push(now);
+  userHits.set(userId, filtered);
+
+  return filtered.length > LIMIT_PER_HOUR;
 }
 
-/* ================= CAPTION ================= */
-function caption(m) {
-  return [
-    `🎬 ${m.platform}`,
-    '',
-    m.author ? `👤 ${m.author}` : '',
-    m.description ? `📝 ${m.description}` : '',
-    '',
-    m.views ? `👁️ ${m.views}` : '',
-    m.likes ? `👍 ${m.likes}` : '',
-    m.duration ? `⏱️ ${m.duration} detik` : '',
-    m.size ? `📦 ${m.size}` : ''
-  ].filter(Boolean).join('\n');
+/* =======================
+   ANIMATED BAR
+======================= */
+const BAR_FRAMES = ['⏳', '⌛'];
+let barFrame = 0;
+
+function animatedBar(percent, width = 10) {
+  const filled = Math.round((percent / 100) * width);
+  const empty = width - filled;
+  barFrame = (barFrame + 1) % BAR_FRAMES.length;
+  return `${BAR_FRAMES[barFrame]} ${'█'.repeat(filled)}${'░'.repeat(empty)}`;
 }
 
-/* ================= PROGRESS ================= */
-const bar = p =>
-  '█'.repeat(Math.round(p / 10)) +
-  '░'.repeat(10 - Math.round(p / 10));
+/* =======================
+   CLEANUP
+======================= */
+function cleanup(file) {
+  if (fs.existsSync(file)) {
+    fs.unlink(file, () => {});
+  }
+}
 
-/* ================= YT-DLP ================= */
-function runYtdlp(url, mp3, onProg) {
-  return new Promise((res, rej) => {
-    const id = hash(url);
-    if (fileCache.has(id)) return res(fileCache.get(id));
+/* =======================
+   DOWNLOAD CORE
+======================= */
+async function downloadMedia({ chatId, url, audioOnly }) {
+  const key = hash(url + (audioOnly ? ':mp3' : ':video'));
+  const cached = getCache(key);
 
-    const out = `${TMP_DIR}/${id}.%(ext)s`;
-    const cmd = [
-      'yt-dlp',
-      COOKIES ? `--cookies "${COOKIES}"` : '',
-      '--newline',
-      '--no-playlist',
-      mp3 ? '-x --audio-format mp3' : '-f bestvideo+bestaudio/best',
-      `-o "${out}"`,
-      `"${url}"`
-    ].join(' ');
+  if (cached && fs.existsSync(cached.file)) {
+    return cached.file;
+  }
 
-    let emaEta = null;
-    const alpha = 0.2;
+  const outFile = path.join(
+    TMP_DIR,
+    `${Date.now()}-${Math.random().toString(36).slice(2)}.${audioOnly ? 'mp3' : 'mp4'}`
+  );
 
-    const p = exec(cmd);
-    p.stdout.on('data', d => {
-      const s = d.toString();
-      const m = s.match(/(\d+\.\d+)%.*?ETA\s+([\d:]+)/);
-      const sp = s.match(/(\d+\.\d+)(MiB|KiB)\/s/);
+  const args = [
+    url,
+    '-o', outFile,
+    '--newline',
+    '--progress-template', '%(progress._percent_str)s'
+  ];
 
-      if (m) {
-        const eta = m[2];
-        emaEta = emaEta
-          ? alpha * eta + (1 - alpha) * emaEta
-          : eta;
+  if (audioOnly) {
+    args.unshift('-x', '--audio-format', 'mp3');
+  }
 
-        onProg({
-          percent: +m[1],
-          eta: emaEta,
-          speed: sp ? `${sp[1]} ${sp[2]}/s` : '-'
-        });
+  return new Promise((resolve, reject) => {
+    const proc = spawn('yt-dlp', args);
+
+    let lastPercent = 0;
+
+    proc.stdout.on('data', async data => {
+      const text = data.toString();
+      const match = text.match(/(\d+(?:\.\d+)?)%/);
+      if (match) {
+        lastPercent = parseFloat(match[1]);
+        if (lastPercent > 100) lastPercent = 100;
+        try {
+          await bot.editMessageText(
+            `Downloading...\n${lastPercent.toFixed(1)}%\n${animatedBar(lastPercent)}`,
+            {
+              chat_id: chatId,
+              message_id: currentProgressMsg
+            }
+          );
+        } catch {}
       }
     });
 
-    p.on('close', c => {
-      if (c !== 0) return rej();
-      const f = fs.readdirSync(TMP_DIR).find(v => v.startsWith(id));
-      const fp = path.join(TMP_DIR, f);
-      fileCache.set(id, fp);
-      res(fp);
+    proc.on('close', code => {
+      if (code === 0 && fs.existsSync(outFile)) {
+        setCache(key, { file: outFile, at: Date.now() });
+        resolve(outFile);
+      } else {
+        cleanup(outFile);
+        reject(new Error('Download failed'));
+      }
     });
   });
 }
 
-/* ================= QUEUE ================= */
-async function processQueue() {
-  if (running >= MAX_QUEUE || !queue.length) return;
-  running++;
+/* =======================
+   HANDLERS
+======================= */
+let currentProgressMsg = null;
 
-  const j = queue.shift();
-  try {
-    const meta = await extractMeta(j.url);
-    let last = 0;
-
-    const msg = await bot.sendMessage(
-      j.chat,
-      `⏳ Downloading...\n0%\n${bar(0)}`
-    );
-
-    const file = await runYtdlp(j.url, j.mp3, async p => {
-      if (Date.now() - last < 4000) return;
-      last = Date.now();
-      await bot.editMessageText(
-        `⏳ Downloading...\n${p.percent.toFixed(1)}%\n${bar(
-          p.percent
-        )}\n📶 ${p.speed}\nETA ${p.eta}`,
-        { chat_id: j.chat, message_id: msg.message_id }
-      );
-    });
-
-    await bot.sendDocument(j.chat, file, { caption: caption(meta) });
-    incUsage(j.user);
-  } catch {
-    bot.sendMessage(j.chat, '❌ Gagal download');
-  } finally {
-    running--;
-    cleanup();
-    processQueue();
-  }
-}
-
-/* ================= COMMANDS ================= */
-bot.onText(/\/start/, m =>
+bot.onText(/\/start/, msg => {
   bot.sendMessage(
-    m.chat.id,
+    msg.chat.id,
     `👋 Welcome SocialMediaDownloader
+
 📥 Kirim link TikTok / FB / IG / YT
-🎵 /mp3 <link>
-📊 /stats`
-  )
-);
-
-bot.onText(/\/stats/, m =>
-  bot.sendMessage(
-    m.chat.id,
-    `📊 Queue ${queue.length}
-⚙️ Running ${running}
-📦 Cache ${fileCache.size}`
-  )
-);
-
-bot.onText(/\/mp3 (.+)/, (m, g) => {
-  if (!canUse(m.from.id))
-    return bot.sendMessage(m.chat.id, '❌ Limit tercapai');
-
-  queue.push({ chat: m.chat.id, user: m.from.id, url: g[1], mp3: true });
-  processQueue();
+🎵 /mp3 <link> → audio only
+📊 /stats → statistik`
+  );
 });
 
-bot.on('message', m => {
-  if (!m.text || m.text.startsWith('/')) return;
-  if (!canUse(m.from.id))
-    return bot.sendMessage(m.chat.id, '❌ Limit tercapai');
+bot.onText(/\/mp3 (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const url = match[1];
 
-  queue.push({ chat: m.chat.id, user: m.from.id, url: m.text, mp3: false });
-  processQueue();
+  if (isLimited(msg.from.id)) {
+    return bot.sendMessage(chatId, '❌ Limit tercapai');
+  }
+
+  currentProgressMsg = (await bot.sendMessage(chatId, 'Downloading...\n0%\n⏳ ░░░░░░░░░░')).message_id;
+
+  try {
+    const file = await downloadMedia({ chatId, url, audioOnly: true });
+
+    // auto-hide progress
+    try { await bot.deleteMessage(chatId, currentProgressMsg); } catch {}
+
+    await bot.sendAudio(chatId, fs.createReadStream(file));
+  } catch {
+    try { await bot.deleteMessage(chatId, currentProgressMsg); } catch {}
+    bot.sendMessage(chatId, '❌ Gagal download');
+  }
 });
 
-console.log('✅ BOT WEBHOOK FINAL RUNNING');
+bot.on('message', async msg => {
+  if (!msg.text) return;
+  if (msg.text.startsWith('/')) return;
+
+  const chatId = msg.chat.id;
+  const url = msg.text.trim();
+
+  if (!/^https?:\/\//i.test(url)) return;
+
+  if (isLimited(msg.from.id)) {
+    return bot.sendMessage(chatId, '❌ Limit tercapai');
+  }
+
+  currentProgressMsg = (await bot.sendMessage(chatId, 'Downloading...\n0%\n⏳ ░░░░░░░░░░')).message_id;
+
+  try {
+    const file = await downloadMedia({ chatId, url, audioOnly: false });
+
+    // auto-hide progress
+    try { await bot.deleteMessage(chatId, currentProgressMsg); } catch {}
+
+    await bot.sendVideo(chatId, fs.createReadStream(file), {
+      caption: '🎬 Video'
+    });
+  } catch {
+    try { await bot.deleteMessage(chatId, currentProgressMsg); } catch {}
+    bot.sendMessage(chatId, '❌ Gagal download');
+  }
+});
