@@ -1,132 +1,208 @@
-const TelegramBot = require("node-telegram-bot-api");
-const { spawn } = require("child_process");
-const fs = require("fs");
-const PQueue = require("p-queue").default;
+import TelegramBot from "node-telegram-bot-api";
+import { exec } from "child_process";
+import fs from "fs";
+import path from "path";
+import os from "os";
 
-const TOKEN = process.env.BOT_TOKEN;
-const ADMIN_ID = process.env.ADMIN_ID; // optional
+// ================== CONFIG ==================
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const ADMIN_IDS = (process.env.ADMIN_IDS || "")
+  .split(",")
+  .map((x) => x.trim())
+  .filter(Boolean);
 
-if (!TOKEN) {
-  console.error("BOT_TOKEN kosong");
+const MAX_QUEUE = 2;
+const MAX_USER_DAILY = 5;
+
+// ================== INIT ==================
+if (!BOT_TOKEN) {
+  console.error("❌ BOT_TOKEN belum di set");
   process.exit(1);
 }
 
-const bot = new TelegramBot(TOKEN, { polling: true });
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+console.log("🤖 Bot started");
 
-// ===== QUEUE (ANTI CRASH) =====
-const queue = new PQueue({
-  concurrency: 1,
-  intervalCap: 2,
-  interval: 5000
-});
+// ================== STATE ==================
+const queue = [];
+let active = 0;
 
-// ===== STATS =====
+const userLimit = new Map(); // userId -> count
 const stats = {
   total: 0,
   success: 0,
   failed: 0,
-  startTime: Date.now()
 };
 
-// ===== UTIL =====
-function detectPlatform(url) {
-  if (/tiktok\.com/.test(url)) return "TikTok";
-  if (/youtu\.be|youtube\.com/.test(url)) return "YouTube";
-  if (/facebook\.com|fb\.watch/.test(url)) return "Facebook";
-  return "Unknown";
+// ================== UTIL ==================
+function isAdmin(id) {
+  return ADMIN_IDS.includes(String(id));
 }
 
-// ===== COMMANDS =====
-bot.onText(/\/start/, msg => {
-  bot.sendMessage(
-    msg.chat.id,
-    "👋 Kirim link YouTube / TikTok / Facebook\n\n⚡ Auto detect • Queue aman • Anti hang"
-  );
-});
+function incLimit(userId) {
+  const v = userLimit.get(userId) || 0;
+  userLimit.set(userId, v + 1);
+}
 
-bot.onText(/\/stats/, msg => {
-  const uptime = Math.floor((Date.now() - stats.startTime) / 1000);
-  bot.sendMessage(
-    msg.chat.id,
-    `📊 BOT STATS
-━━━━━━━━━━━━━━
-📥 Total: ${stats.total}
-✅ Success: ${stats.success}
-❌ Failed: ${stats.failed}
-⏱ Uptime: ${uptime}s
-📦 Queue: ${queue.size}`
-  );
-});
+function overLimit(userId) {
+  if (isAdmin(userId)) return false;
+  return (userLimit.get(userId) || 0) >= MAX_USER_DAILY;
+}
 
-// ===== MAIN HANDLER =====
-bot.on("message", msg => {
-  if (!msg.text) return;
-  if (msg.text.startsWith("/")) return;
+function detectPlatform(url) {
+  if (/tiktok\.com/.test(url)) return "tiktok";
+  if (/youtu\.be|youtube\.com/.test(url)) return "youtube";
+  if (/facebook\.com|fb\.watch/.test(url)) return "facebook";
+  return null;
+}
 
-  const url = msg.text.trim();
-  if (!/^https?:\/\//.test(url)) return;
+function detectFormat(platform) {
+  if (platform === "tiktok") return "mp4";
+  if (platform === "facebook") return "mp4";
+  return "bestvideo+bestaudio/best";
+}
 
-  queue.add(() => handleDownload(msg, url));
-});
-
-// ===== DOWNLOAD LOGIC =====
-async function handleDownload(msg, url) {
-  const chatId = msg.chat.id;
-  const platform = detectPlatform(url);
-
-  stats.total++;
-
-  await bot.sendMessage(chatId, `⏳ Processing ${platform}...\n📦 Queue: ${queue.size}`);
-
-  const outFile = `video_${Date.now()}.mp4`;
-
-  const args = [
+function buildYtdlpCmd(url, out) {
+  return [
+    "yt-dlp",
+    "--no-playlist",
     "-f",
-    "bv*[height<=720]+ba/b[height<=720]",
-    "--merge-output-format",
-    "mp4",
-    "--max-filesize",
-    "90M",
+    `"bestvideo[height<=1080]+bestaudio/best[height<=1080]"`,
+    "--merge-output-format mp4",
+    `"${url}"`,
     "-o",
-    outFile,
-    url
-  ];
+    `"${out}"`,
+  ].join(" ");
+}
 
-  // ===== SPAWN (ANTI HANG) =====
-  const proc = spawn("yt-dlp", args);
+// ================== QUEUE ==================
+function enqueue(job) {
+  queue.push(job);
+  processQueue();
+}
 
-  let killed = false;
+async function processQueue() {
+  if (active >= MAX_QUEUE) return;
+  const job = queue.shift();
+  if (!job) return;
 
-  const timeout = setTimeout(() => {
-    killed = true;
-    proc.kill("SIGKILL");
-  }, 60000); // 60s MAX
+  active++;
+  await runJob(job).catch(() => {});
+  active--;
+  processQueue();
+}
 
-  proc.on("close", async code => {
-    clearTimeout(timeout);
+// ================== DOWNLOAD ==================
+async function runJob({ chatId, userId, url, platform }) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "dl-"));
+  const outFile = path.join(tmpDir, "video.mp4");
 
-    if (killed || code !== 0 || !fs.existsSync(outFile)) {
-      stats.failed++;
-      await bot.sendMessage(chatId, "❌ Download gagal / timeout");
-      cleanup(outFile);
-      return;
-    }
+  try {
+    console.log("⬇️ Download:", url);
 
-    try {
-      await bot.sendVideo(chatId, outFile, { caption: "✅ Download selesai" });
-      stats.success++;
-    } catch (e) {
-      stats.failed++;
-      await bot.sendMessage(chatId, "❌ Gagal kirim ke Telegram (size limit)");
-    }
+    const cmd = buildYtdlpCmd(url, outFile);
+    await execPromise(cmd);
 
-    cleanup(outFile);
+    if (!fs.existsSync(outFile)) throw new Error("File tidak ada");
+
+    await bot.sendVideo(chatId, outFile, {
+      caption: `✅ Selesai\n📦 Platform: ${platform.toUpperCase()}`,
+    });
+
+    stats.success++;
+  } catch (err) {
+    console.error("❌ Download error:", err.message);
+    stats.failed++;
+    await bot.sendMessage(chatId, "❌ Download gagal");
+  } finally {
+    stats.total++;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+function execPromise(cmd) {
+  return new Promise((resolve, reject) => {
+    exec(cmd, { maxBuffer: 1024 * 1024 * 50 }, (err) => {
+      if (err) reject(err);
+      else resolve();
+    });
   });
 }
 
-// ===== CLEANUP =====
-function cleanup(file) {
-  if (fs.existsSync(file)) fs.unlinkSync(file);
-}
+// ================== COMMANDS ==================
+bot.onText(/\/start/, (msg) => {
+  bot.sendMessage(
+    msg.chat.id,
+    `👋 Bot Aktif
 
-console.log("✅ Bot running...");
+📌 Kirim link:
+• TikTok
+• YouTube
+• Facebook
+
+⚠️ Jika bot diam:
+1️⃣ Privacy Mode OFF
+2️⃣ Restart bot`
+  );
+});
+
+bot.onText(/\/stats/, (msg) => {
+  bot.sendMessage(
+    msg.chat.id,
+    `📊 Statistik Bot
+━━━━━━━━━━━━
+📥 Total: ${stats.total}
+✅ Sukses: ${stats.success}
+❌ Gagal: ${stats.failed}
+⏳ Queue: ${queue.length}
+⚙️ Aktif: ${active}`
+  );
+});
+
+// ================== MESSAGE HANDLER (PENTING) ==================
+bot.on("message", async (msg) => {
+  try {
+    if (!msg.text) return;
+
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    const text = msg.text.trim();
+
+    // ignore command
+    if (text.startsWith("/")) return;
+
+    console.log("📩 MESSAGE:", text);
+
+    const match = text.match(/https?:\/\/\S+/);
+    if (!match) {
+      return bot.sendMessage(chatId, "❗ Kirim link video yang valid");
+    }
+
+    if (overLimit(userId)) {
+      return bot.sendMessage(chatId, "🚫 Limit harian tercapai");
+    }
+
+    const url = match[0];
+    const platform = detectPlatform(url);
+
+    if (!platform) {
+      return bot.sendMessage(chatId, "❌ Platform tidak didukung");
+    }
+
+    incLimit(userId);
+
+    await bot.sendMessage(
+      chatId,
+      `⏳ Processing ${platform.toUpperCase()}
+📥 Queue: ${queue.length + 1}`
+    );
+
+    enqueue({ chatId, userId, url, platform });
+  } catch (e) {
+    console.error("❌ Handler error:", e);
+  }
+});
+
+// ================== SAFETY ==================
+process.on("uncaughtException", (e) => console.error("🔥", e));
+process.on("unhandledRejection", (e) => console.error("🔥", e));
