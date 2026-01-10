@@ -1,208 +1,159 @@
-import TelegramBot from "node-telegram-bot-api";
-import { exec } from "child_process";
-import fs from "fs";
-import path from "path";
-import os from "os";
+const TelegramBot = require("node-telegram-bot-api");
+const { spawn } = require("child_process");
+const fs = require("fs");
+const path = require("path");
 
-// ================== CONFIG ==================
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const ADMIN_IDS = (process.env.ADMIN_IDS || "")
-  .split(",")
-  .map((x) => x.trim())
-  .filter(Boolean);
-
+/* ================= CONFIG ================= */
+const TOKEN = process.env.BOT_TOKEN;
+const ADMIN_ID = process.env.ADMIN_ID; // contoh: 123456789
+const DOWNLOAD_DIR = "./downloads";
 const MAX_QUEUE = 2;
-const MAX_USER_DAILY = 5;
+/* ========================================== */
 
-// ================== INIT ==================
-if (!BOT_TOKEN) {
-  console.error("❌ BOT_TOKEN belum di set");
+if (!TOKEN) {
+  console.error("❌ BOT_TOKEN TIDAK ADA");
   process.exit(1);
 }
 
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-console.log("🤖 Bot started");
+if (!fs.existsSync(DOWNLOAD_DIR)) {
+  fs.mkdirSync(DOWNLOAD_DIR);
+}
 
-// ================== STATE ==================
+console.log("🚀 BOT STARTING...");
+
+const bot = new TelegramBot(TOKEN, { polling: true });
+
+console.log("✅ BOT STARTED & POLLING");
+
+/* ================= QUEUE ================= */
 const queue = [];
-let active = 0;
+let running = 0;
 
-const userLimit = new Map(); // userId -> count
-const stats = {
-  total: 0,
-  success: 0,
-  failed: 0,
-};
+function runQueue() {
+  if (running >= MAX_QUEUE || queue.length === 0) return;
+  const job = queue.shift();
+  running++;
+  job()
+    .catch(console.error)
+    .finally(() => {
+      running--;
+      runQueue();
+    });
+}
+/* ========================================= */
 
-// ================== UTIL ==================
+/* ================= UTILS ================= */
 function isAdmin(id) {
-  return ADMIN_IDS.includes(String(id));
-}
-
-function incLimit(userId) {
-  const v = userLimit.get(userId) || 0;
-  userLimit.set(userId, v + 1);
-}
-
-function overLimit(userId) {
-  if (isAdmin(userId)) return false;
-  return (userLimit.get(userId) || 0) >= MAX_USER_DAILY;
+  return ADMIN_ID && String(id) === String(ADMIN_ID);
 }
 
 function detectPlatform(url) {
-  if (/tiktok\.com/.test(url)) return "tiktok";
-  if (/youtu\.be|youtube\.com/.test(url)) return "youtube";
-  if (/facebook\.com|fb\.watch/.test(url)) return "facebook";
-  return null;
+  if (/tiktok\.com/i.test(url)) return "tiktok";
+  if (/youtu\.be|youtube\.com/i.test(url)) return "youtube";
+  if (/facebook\.com|fb\.watch/i.test(url)) return "facebook";
+  return "unknown";
 }
+/* ========================================= */
 
-function detectFormat(platform) {
-  if (platform === "tiktok") return "mp4";
-  if (platform === "facebook") return "mp4";
-  return "bestvideo+bestaudio/best";
-}
-
-function buildYtdlpCmd(url, out) {
-  return [
-    "yt-dlp",
-    "--no-playlist",
-    "-f",
-    `"bestvideo[height<=1080]+bestaudio/best[height<=1080]"`,
-    "--merge-output-format mp4",
-    `"${url}"`,
-    "-o",
-    `"${out}"`,
-  ].join(" ");
-}
-
-// ================== QUEUE ==================
-function enqueue(job) {
-  queue.push(job);
-  processQueue();
-}
-
-async function processQueue() {
-  if (active >= MAX_QUEUE) return;
-  const job = queue.shift();
-  if (!job) return;
-
-  active++;
-  await runJob(job).catch(() => {});
-  active--;
-  processQueue();
-}
-
-// ================== DOWNLOAD ==================
-async function runJob({ chatId, userId, url, platform }) {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "dl-"));
-  const outFile = path.join(tmpDir, "video.mp4");
-
-  try {
-    console.log("⬇️ Download:", url);
-
-    const cmd = buildYtdlpCmd(url, outFile);
-    await execPromise(cmd);
-
-    if (!fs.existsSync(outFile)) throw new Error("File tidak ada");
-
-    await bot.sendVideo(chatId, outFile, {
-      caption: `✅ Selesai\n📦 Platform: ${platform.toUpperCase()}`,
-    });
-
-    stats.success++;
-  } catch (err) {
-    console.error("❌ Download error:", err.message);
-    stats.failed++;
-    await bot.sendMessage(chatId, "❌ Download gagal");
-  } finally {
-    stats.total++;
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-  }
-}
-
-function execPromise(cmd) {
-  return new Promise((resolve, reject) => {
-    exec(cmd, { maxBuffer: 1024 * 1024 * 50 }, (err) => {
-      if (err) reject(err);
-      else resolve();
-    });
-  });
-}
-
-// ================== COMMANDS ==================
+/* ================= COMMAND ================= */
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    `👋 Bot Aktif
-
-📌 Kirim link:
-• TikTok
-• YouTube
-• Facebook
-
-⚠️ Jika bot diam:
-1️⃣ Privacy Mode OFF
-2️⃣ Restart bot`
+    "👋 **Downloader Bot Aktif**\n\nKirim link:\n• YouTube\n• TikTok\n• Facebook",
+    { parse_mode: "Markdown" }
   );
 });
 
 bot.onText(/\/stats/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    `📊 Statistik Bot
-━━━━━━━━━━━━
-📥 Total: ${stats.total}
-✅ Sukses: ${stats.success}
-❌ Gagal: ${stats.failed}
-⏳ Queue: ${queue.length}
-⚙️ Aktif: ${active}`
+    `📊 STATUS\nQueue: ${queue.length}\nRunning: ${running}`
   );
 });
+/* ========================================== */
 
-// ================== MESSAGE HANDLER (PENTING) ==================
+/* ================= MESSAGE ================= */
 bot.on("message", async (msg) => {
-  try {
-    if (!msg.text) return;
+  if (!msg.text) return;
+  if (msg.text.startsWith("/")) return;
 
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
-    const text = msg.text.trim();
+  const url = msg.text.trim();
+  const platform = detectPlatform(url);
 
-    // ignore command
-    if (text.startsWith("/")) return;
-
-    console.log("📩 MESSAGE:", text);
-
-    const match = text.match(/https?:\/\/\S+/);
-    if (!match) {
-      return bot.sendMessage(chatId, "❗ Kirim link video yang valid");
-    }
-
-    if (overLimit(userId)) {
-      return bot.sendMessage(chatId, "🚫 Limit harian tercapai");
-    }
-
-    const url = match[0];
-    const platform = detectPlatform(url);
-
-    if (!platform) {
-      return bot.sendMessage(chatId, "❌ Platform tidak didukung");
-    }
-
-    incLimit(userId);
-
-    await bot.sendMessage(
-      chatId,
-      `⏳ Processing ${platform.toUpperCase()}
-📥 Queue: ${queue.length + 1}`
-    );
-
-    enqueue({ chatId, userId, url, platform });
-  } catch (e) {
-    console.error("❌ Handler error:", e);
+  if (platform === "unknown") {
+    return bot.sendMessage(msg.chat.id, "❌ Link tidak didukung");
   }
-});
 
-// ================== SAFETY ==================
-process.on("uncaughtException", (e) => console.error("🔥", e));
-process.on("unhandledRejection", (e) => console.error("🔥", e));
+  const keyboard = {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "🎥 720p", callback_data: `dl|720|${url}` },
+          { text: "🎬 1080p", callback_data: `dl|1080|${url}` }
+        ],
+        [{ text: "🎧 Audio (MP3)", callback_data: `dl|audio|${url}` }]
+      ]
+    }
+  };
+
+  bot.sendMessage(
+    msg.chat.id,
+    `📥 **Link terdeteksi:** ${platform}\nPilih format:`,
+    { parse_mode: "Markdown", ...keyboard }
+  );
+});
+/* ========================================== */
+
+/* ================= CALLBACK ================= */
+bot.on("callback_query", async (q) => {
+  const chatId = q.message.chat.id;
+  const userId = q.from.id;
+
+  const [cmd, quality, url] = q.data.split("|");
+  if (cmd !== "dl") return;
+
+  bot.answerCallbackQuery(q.id, { text: "⏳ Diproses..." });
+
+  queue.push(async () => {
+    const ext = quality === "audio" ? "mp3" : "mp4";
+    const filename = `${Date.now()}.${ext}`;
+    const filepath = path.join(DOWNLOAD_DIR, filename);
+
+    let args = [
+      "-o", filepath,
+      "--no-playlist",
+      url
+    ];
+
+    if (quality === "audio") {
+      args.unshift("-x", "--audio-format", "mp3");
+    } else {
+      args.unshift("-f", `bv*[height<=${quality}]+ba/b`);
+    }
+
+    console.log("⬇️ DOWNLOAD:", url);
+
+    await new Promise((resolve, reject) => {
+      const ytdlp = spawn("yt-dlp", args);
+
+      ytdlp.stderr.on("data", d => console.log(d.toString()));
+      ytdlp.on("error", reject);
+      ytdlp.on("close", code => {
+        if (code === 0) resolve();
+        else reject(new Error("yt-dlp error"));
+      });
+    });
+
+    await bot.sendDocument(chatId, filepath);
+    fs.unlinkSync(filepath);
+  });
+
+  runQueue();
+});
+/* ========================================== */
+
+/* ================= ERROR ================= */
+bot.on("polling_error", (e) => {
+  console.error("❌ POLLING ERROR:", e.message);
+});
+/* ========================================== */
