@@ -82,7 +82,8 @@ async function fetchMeta(url) {
           title: j.title || 'Video',
           author: j.uploader || j.channel || '-',
           views: j.view_count || 0,
-          duration: j.duration || '-'
+          duration: j.duration || '-',
+          description: j.description || 'No description available.'
         };
         cache[key] = meta;
         saveMeta(cache);
@@ -100,7 +101,8 @@ function buildCaption(m) {
 `🎬 ${m.title}
 👤 ${m.author}
 👁️ ${m.views.toLocaleString()} views
-⏱️ ${m.duration} detik`
+⏱️ ${m.duration} detik
+📜 ${m.description}`
   );
 }
 
@@ -121,7 +123,7 @@ function cachedFile(url, mp3) {
 
 async function download(url, mp3, onProgress) {
   const output = path.join(FILE_DIR, `${hash(url)}.%(ext)s`);
-  const args = ['--newline', '--no-playlist', '-o', output, url];
+  const args = ['--newline', '--no-playlist', '--no-post-overwrites', '-o', output, url];
   if (mp3) args.unshift('-x', '--audio-format', 'mp3');
 
   return new Promise((resolve, reject) => {
@@ -200,7 +202,7 @@ function canUse(id) {
 bot.onText(/\/start/, m => {
   bot.sendMessage(m.chat.id,
 `👋 Welcome Downloader Bot
-📥 Kirim link TikTok / IG / FB / YT
+📥 Kirim link TikTok / FB / YT
 🎵 /mp3 <link>
 📊 /stats`);
 });
